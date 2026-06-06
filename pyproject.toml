@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "whispertome"
+version = "0.1.0"
+description = "NPU-only local STT/TTS voice loop backed by the OpenAI Responses API."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "kokoro-onnx>=0.5.0",
+  "numpy>=1.26",
+  "openai>=2.0",
+  "soundfile>=0.13",
+  "sounddevice>=0.4.7",
+]
+
+[project.optional-dependencies]
+directml = [
+  "onnxruntime-directml>=1.20",
+]
+qnn = [
+  "onnx>=1.17",
+  "onnxruntime-qnn>=1.18; platform_system == 'Windows'",
+]
+dev = [
+  "ruff>=0.8",
+  "pytest>=8.0",
+]
+
+[project.scripts]
+whispertome = "whispertome.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/whispertome"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
