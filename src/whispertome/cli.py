@@ -293,6 +293,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=10,
         help="Terminal font size inside the desktop window.",
     )
+    desktop_parser.add_argument(
+        "--show-console",
+        action="store_true",
+        help="Dev/debug only: keep the desktop host console window visible.",
+    )
 
     demo_parser = subparsers.add_parser(
         "demo",
@@ -550,12 +555,39 @@ def _print_headless_error(message: str, *, console_enabled: bool) -> None:
     print(f"\nFatal error: {message}", file=sys.stderr, flush=True)
 
 
+def _hide_windows_console() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        hwnd = ctypes.WinDLL("kernel32", use_last_error=True).GetConsoleWindow()
+        if not hwnd:
+            return
+        sw_hide = 0
+        ctypes.WinDLL("user32", use_last_error=True).ShowWindow(hwnd, sw_hide)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("desktop_console_hide_failed error=%s", exc)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     log_file = resolve_log_file(args)
     console_enabled = not bool(getattr(args, "tui", False))
+    if getattr(args, "command", None) == "desktop" and not getattr(
+        args,
+        "show_console",
+        False,
+    ):
+        console_enabled = False
     configure_logging(args.verbose, log_file, console=console_enabled)
+    if getattr(args, "command", None) == "desktop" and not getattr(
+        args,
+        "show_console",
+        False,
+    ):
+        _hide_windows_console()
     if log_file is not None:
         logging.getLogger(__name__).info("log_file=%s", log_file)
 

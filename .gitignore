@@ -1,5 +1,7 @@
 .env
 .venv/
+
+# Python/cache/build artifacts
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -7,6 +9,8 @@ __pycache__/
 .ruff_cache/
 dist/
 build/
+
+# Local models, generated runtime files, and large binary artifacts
 models/
 artifacts/
 *.onnx
@@ -14,3 +18,17 @@ artifacts/
 *.wav
 *.log
 
+# Local experiments and scratch junk
+.tmp/
+tmp/
+scratch/
+junk/
+research/
+experiments/
+experiment*/
+notes.md
+*.tmp
+*.bak
+*.swp
+Thumbs.db
+.DS_Store

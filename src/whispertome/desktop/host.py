@@ -227,6 +227,7 @@ class DesktopTerminalHost:
         self._configure_terminal_tags(terminal)
         self._restore_or_center_window(reason="startup")
         root.bind("<Configure>", self._on_root_configure)
+        root.bind("<Unmap>", self._on_root_unmap, add="+")
         root.after(GEOMETRY_TRACKING_DELAY_MS, self._enable_position_tracking)
         root.deiconify()
 
@@ -294,6 +295,31 @@ class DesktopTerminalHost:
             placement.width,
             placement.height,
         )
+
+    def _on_root_unmap(self, event: object) -> None:
+        root = self._root
+        if root is None or getattr(event, "widget", None) is not root:
+            return
+        try:
+            state = str(root.state())  # type: ignore[attr-defined]
+        except Exception:
+            return
+        if state == "iconic":
+            root.after(0, self._hide_iconified_window_to_tray)  # type: ignore[attr-defined]
+
+    def _hide_iconified_window_to_tray(self) -> None:
+        root = self._root
+        if root is None:
+            return
+        try:
+            state = str(root.state())  # type: ignore[attr-defined]
+        except Exception as exc:
+            LOGGER.warning("desktop_minimize_state_check_failed error=%s", exc)
+            return
+        if state != "iconic":
+            return
+        self._hide_to_tray()
+        LOGGER.info("desktop_window_hidden reason=minimize_button")
 
     def _read_root_placement(self, *, manual: bool) -> WindowPlacement | None:
         root = self._root

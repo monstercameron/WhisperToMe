@@ -36,6 +36,7 @@ def test_desktop_parser_accepts_window_and_voice_loop_options() -> None:
             "900",
             "--font-size",
             "12",
+            "--show-console",
             "--tui-lines",
             "6",
             "--no-stream-tts",
@@ -52,6 +53,7 @@ def test_desktop_parser_accepts_window_and_voice_loop_options() -> None:
     assert args.window_width == 1280
     assert args.window_height == 900
     assert args.font_size == 12
+    assert args.show_console
     assert args.tui_lines == 6
     assert args.no_stream_tts
 
@@ -62,6 +64,7 @@ def test_desktop_parser_defaults_to_800_by_600() -> None:
     assert args.window_width == 800
     assert args.window_height == 600
     assert args.font_size == 10
+    assert not args.show_console
 
 
 def test_desktop_gets_default_host_log_file_under_project_root() -> None:
