@@ -228,7 +228,7 @@ def load_config(project_root: Path | None = None, *, require_openai_key: bool = 
             block_ms=_env_int("WHISPERTOME_AUDIO_BLOCK_MS", 30),
             vad_rms_threshold=_env_float("WHISPERTOME_VAD_RMS_THRESHOLD", 0.012),
             speech_start_ms=_env_int("WHISPERTOME_SPEECH_START_MS", 150),
-            speech_end_ms=_env_int("WHISPERTOME_SPEECH_END_MS", 700),
+            speech_end_ms=_env_int("WHISPERTOME_SPEECH_END_MS", 1200),
             pre_roll_ms=_env_int("WHISPERTOME_PRE_ROLL_MS", 600),
             max_utterance_ms=_env_int("WHISPERTOME_MAX_UTTERANCE_MS", 15000),
         ),

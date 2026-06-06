@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
@@ -153,6 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="Start the live voice loop.")
     add_wake_args(run_parser)
+    add_live_loop_args(run_parser)
 
     demo_parser = subparsers.add_parser(
         "demo",
@@ -201,6 +202,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Override WHISPERTOME_VAD_RMS_THRESHOLD for this demo run.",
+    )
+    demo_parser.add_argument(
+        "--speech-end-ms",
+        type=int,
+        default=None,
+        help="Override silence duration required before ending an utterance.",
     )
     demo_parser.add_argument(
         "--no-play",
@@ -304,11 +311,73 @@ def add_wake_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def configure_logging(verbose: bool, log_file: Path | None) -> None:
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
+def add_live_loop_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--turns",
+        type=int,
+        default=0,
+        help="Maximum completed command turns to run. 0 means keep going until Ctrl+C.",
+    )
+    parser.add_argument(
+        "--allow-non-npu",
+        action="store_true",
+        help="Debug only: allow non-NPU TTS so the wake loop can speak now.",
+    )
+    parser.add_argument(
+        "--save-audio",
+        action="store_true",
+        help="Save every STT utterance and assistant response under artifacts/wake.",
+    )
+    parser.add_argument(
+        "--no-warmup",
+        action="store_true",
+        help="Do not preload STT/TTS models before listening.",
+    )
+    parser.add_argument(
+        "--min-speech-ms",
+        type=int,
+        default=250,
+        help="Skip STT when detected speech activity is shorter than this.",
+    )
+    parser.add_argument(
+        "--vad-threshold",
+        type=float,
+        default=None,
+        help="Override WHISPERTOME_VAD_RMS_THRESHOLD for this run.",
+    )
+    parser.add_argument(
+        "--speech-end-ms",
+        type=int,
+        default=None,
+        help="Override silence duration required before ending an utterance.",
+    )
+    parser.add_argument(
+        "--no-play",
+        action="store_true",
+        help="Do not play assistant TTS audio.",
+    )
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Render a live terminal UI instead of console log lines.",
+    )
+    parser.add_argument(
+        "--tui-lines",
+        type=int,
+        default=10,
+        help="Number of system stream lines to show in the TUI, from 1 to 10.",
+    )
+
+
+def configure_logging(verbose: bool, log_file: Path | None, *, console: bool = True) -> None:
+    handlers: list[logging.Handler] = []
+    if console:
+        handlers.append(logging.StreamHandler())
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    if not handlers:
+        handlers.append(logging.NullHandler())
 
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -322,7 +391,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     log_file = resolve_log_file(args)
-    configure_logging(args.verbose, log_file)
+    configure_logging(args.verbose, log_file, console=not bool(getattr(args, "tui", False)))
     if log_file is not None:
         logging.getLogger(__name__).info("log_file=%s", log_file)
 
@@ -334,16 +403,27 @@ def main(argv: list[str] | None = None) -> int:
             )
             return run_doctor(config)
         if args.command == "run":
-            from whispertome.pipeline import VoiceLoop
-
             config = apply_cli_overrides(
                 load_config(args.project_root, require_openai_key=True),
                 args,
             )
-            VoiceLoop.from_config(config).run_forever()
-            return 0
+            return run_wake_loop(
+                config,
+                max_commands=args.turns,
+                allow_non_npu=args.allow_non_npu,
+                save_audio=args.save_audio,
+                play=not args.no_play,
+                warmup=not args.no_warmup,
+                min_speech_ms=args.min_speech_ms,
+                vad_threshold=args.vad_threshold,
+                use_tui=args.tui,
+                tui_lines=args.tui_lines,
+            )
         if args.command == "demo":
-            config = load_config(args.project_root, require_openai_key=True)
+            config = apply_cli_overrides(
+                load_config(args.project_root, require_openai_key=True),
+                args,
+            )
             return run_demo(
                 config,
                 record_ms=args.record_ms,
@@ -402,18 +482,28 @@ def resolve_log_file(args: argparse.Namespace) -> Path | None:
             path = args.project_root / path
         return path
 
-    if args.command == "demo":
+    if args.command in {"demo", "run"}:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        return args.project_root / "artifacts" / "logs" / f"demo-{stamp}.log"
+        return args.project_root / "artifacts" / "logs" / f"{args.command}-{stamp}.log"
 
     return None
 
 
 def apply_cli_overrides(config: AppConfig, args: argparse.Namespace) -> AppConfig:
+    updated = config
     wake_phrases = getattr(args, "wake_phrases", None)
     if wake_phrases:
-        return with_wake_phrases(config, tuple(wake_phrases))
-    return config
+        updated = with_wake_phrases(updated, tuple(wake_phrases))
+
+    speech_end_ms = getattr(args, "speech_end_ms", None)
+    if speech_end_ms is not None:
+        if speech_end_ms <= 0:
+            raise WhisperToMeError("speech-end-ms must be greater than 0")
+        updated = replace(
+            updated,
+            audio=replace(updated.audio, speech_end_ms=speech_end_ms),
+        )
+    return updated
 
 
 def run_doctor(config: AppConfig) -> int:
@@ -476,6 +566,284 @@ def run_test_wake(config: AppConfig, utterances: list[str]) -> int:
             )
         else:
             logger.info("utterance_%d idle", index)
+    return 0
+
+
+def run_wake_loop(
+    config: AppConfig,
+    *,
+    max_commands: int,
+    allow_non_npu: bool,
+    save_audio: bool,
+    play: bool,
+    warmup: bool,
+    min_speech_ms: int,
+    vad_threshold: float | None,
+    use_tui: bool = False,
+    tui_lines: int = 10,
+) -> int:
+    if max_commands < 0:
+        raise WhisperToMeError("turns must be greater than or equal to 0")
+    if min_speech_ms < 0:
+        raise WhisperToMeError("min-speech-ms must be greater than or equal to 0")
+    if tui_lines < 1 or tui_lines > 10:
+        raise WhisperToMeError("tui-lines must be between 1 and 10")
+
+    logger = logging.getLogger(__name__)
+    active_vad_threshold = (
+        config.audio.vad_rms_threshold if vad_threshold is None else vad_threshold
+    )
+    if allow_non_npu:
+        logger.warning(
+            "wake_debug_non_npu_enabled=true production_npu_policy_unchanged=true"
+        )
+    else:
+        logger.info("wake_npu_only_policy=true")
+
+    from whispertome.audio.capture import MicrophoneInput
+    from whispertome.audio.playback import SpeakerOutput
+    from whispertome.audio.vad import EnergyVad, UtteranceSegmenter
+    from whispertome.llm.openai_responses import OpenAIResponder
+    from whispertome.ui.terminal import NullVoiceUi, TerminalVoiceUi
+
+    ui = TerminalVoiceUi(max_lines=tui_lines) if use_tui else NullVoiceUi()
+    ui.start()
+    stt_model = prepare_stt_model(config, allow_non_npu=allow_non_npu)
+    tts_model = prepare_tts_model(
+        config,
+        allow_non_npu=allow_non_npu,
+        prefer_debug_non_npu=allow_non_npu,
+    )
+    responder = OpenAIResponder(config.openai)
+    speaker = SpeakerOutput() if play else None
+    router = WakeCommandRouter(SlidingWakeDetector(config.wake))
+    segmenter = UtteranceSegmenter(config.audio, EnergyVad(active_vad_threshold))
+
+    try:
+        if warmup:
+            warmup_started = perf_counter()
+            logger.info("wake_warmup_started")
+            ui.status("warming models", "QNN STT and TTS voice")
+            stt_model.load()
+            tts_model.load()
+            warmup_ms = (perf_counter() - warmup_started) * 1000.0
+            logger.info(
+                "wake_warmup_complete latency_ms=%.1f",
+                warmup_ms,
+            )
+            ui.status("listening", f"warmup {warmup_ms:.0f} ms")
+
+        audio_dir = config.project_root / "artifacts" / "wake" / datetime.now().strftime(
+            "%Y%m%d-%H%M%S"
+        )
+        if save_audio:
+            audio_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info(
+            (
+                "wake_loop_started wake_phrases=%s max_commands=%d allow_non_npu=%s "
+                "save_audio=%s play=%s vad_threshold=%.6f min_speech_ms=%d"
+            ),
+            ", ".join(config.wake.phrases),
+            max_commands,
+            allow_non_npu,
+            save_audio,
+            play,
+            active_vad_threshold,
+            min_speech_ms,
+        )
+        ui.status("listening", f"wake: {', '.join(config.wake.phrases)}")
+        if not use_tui:
+            print(
+                "Wake loop ready. Say one of: "
+                f"{', '.join(config.wake.phrases)}. Press Ctrl+C to quit."
+            )
+
+        utterance_count = 0
+        command_count = 0
+        chunks = MicrophoneInput(config.audio).chunks()
+        utterances = segmenter.utterances(chunks)
+        for utterance in utterances:
+            utterance_count += 1
+            utterance_started = perf_counter()
+            audio_profile = profile_audio(
+                utterance,
+                active_vad_threshold,
+                config.audio.block_ms,
+            )
+            ui.activity(min(1.0, audio_profile.rms / max(active_vad_threshold * 6.0, 0.001)))
+            ui.status("speech captured", f"{audio_profile.duration_ms} ms")
+            if save_audio:
+                utterance_path = audio_dir / f"utterance-{utterance_count:04d}.wav"
+                save_audio_buffer(utterance, utterance_path)
+                logger.info(
+                    "wake_utterance_audio utterance=%d path=%s",
+                    utterance_count,
+                    utterance_path,
+                )
+
+            if audio_profile.active_ms < min_speech_ms:
+                logger.info(
+                    (
+                        "wake_skip_short_audio utterance=%d active_ms=%d "
+                        "min_speech_ms=%d"
+                    ),
+                    utterance_count,
+                    audio_profile.active_ms,
+                    min_speech_ms,
+                )
+                ui.status("listening", "short audio skipped")
+                continue
+
+            ui.status("transcribing", "QNN Whisper")
+            stt_started = perf_counter()
+            transcript = stt_model.transcribe(utterance)
+            stt_wall_ms = (perf_counter() - stt_started) * 1000.0
+            text = transcript.text.strip()
+            ui.user_text(text)
+            ui.line(f"transcript: {text}")
+            logger.info(
+                (
+                    "wake_transcript utterance=%d duration_ms=%d active_ms=%d "
+                    "wall_ms=%.1f latency_ms=%.1f provider=%s text=%r"
+                ),
+                utterance_count,
+                audio_profile.duration_ms,
+                audio_profile.active_ms,
+                stt_wall_ms,
+                transcript.latency_ms,
+                transcript.provider,
+                text,
+            )
+            if not text:
+                ui.status("listening", "empty transcript")
+                continue
+
+            event = router.process_utterance(text)
+            if event.kind == "idle":
+                ui.status("listening", "wake phrase not detected")
+                continue
+
+            if event.kind == "wake_detected":
+                assert event.match is not None
+                logger.info(
+                    (
+                        "wake_detected utterance=%d phrase=%r score=%.3f "
+                        "matched_text=%r window=%r"
+                    ),
+                    utterance_count,
+                    event.match.phrase,
+                    event.match.score,
+                    event.match.matched_text,
+                    event.match.transcript_window,
+                )
+                ui.status("wake detected", event.match.phrase)
+                if not use_tui:
+                    print("Wake detected. Listening for your command.")
+                continue
+
+            assert event.command is not None
+            command = event.command.strip()
+            command_count += 1
+            ui.user_text(command)
+            ui.status("wake detected", f"command {command_count}")
+            logger.info(
+                "wake_command turn=%d utterance=%d command=%r",
+                command_count,
+                utterance_count,
+                command,
+            )
+            if not use_tui:
+                print(f"You: {command}")
+            if command.lower() in {"q", "quit", "exit", "stop"}:
+                logger.info("wake_command_quit turn=%d", command_count)
+                break
+
+            ui.status("contacting openai", config.openai.model)
+            openai_started = perf_counter()
+            llm_response = responder.generate(command)
+            openai_wall_ms = (perf_counter() - openai_started) * 1000.0
+            ui.assistant_text(llm_response.text)
+            ui.line(f"openai: {llm_response.text}")
+            logger.info(
+                (
+                    "wake_openai turn=%d wall_ms=%.1f latency_ms=%.1f model=%s "
+                    "response_id=%s chars=%d text=%r"
+                ),
+                command_count,
+                openai_wall_ms,
+                llm_response.latency_ms,
+                llm_response.model,
+                llm_response.response_id,
+                len(llm_response.text),
+                llm_response.text,
+            )
+            if not use_tui:
+                print(f"Assistant: {llm_response.text}")
+
+            ui.status("running tts", "Kokoro voice")
+            tts_started = perf_counter()
+            speech = tts_model.synthesize(llm_response.text)
+            tts_wall_ms = (perf_counter() - tts_started) * 1000.0
+            logger.info(
+                "wake_tts turn=%d wall_ms=%.1f latency_ms=%.1f provider=%s sample_rate=%d",
+                command_count,
+                tts_wall_ms,
+                speech.latency_ms,
+                speech.provider,
+                speech.speech.sample_rate,
+            )
+            if save_audio:
+                assistant_path = audio_dir / f"turn-{command_count:03d}-assistant.wav"
+                save_audio_buffer(speech.speech, assistant_path)
+                logger.info(
+                    "wake_assistant_audio turn=%d path=%s",
+                    command_count,
+                    assistant_path,
+                )
+            if speaker is not None:
+                ui.status("playing speech", f"{speech.speech.duration_ms} ms")
+                playback_started = perf_counter()
+                speaker.play(speech.speech)
+                playback_ms = (perf_counter() - playback_started) * 1000.0
+                logger.info("wake_played turn=%d latency_ms=%.1f", command_count, playback_ms)
+            else:
+                playback_ms = 0.0
+
+            logger.info(
+                (
+                    "wake_turn_profile turn=%d utterance=%d total_ms=%.1f "
+                    "stt_wall_ms=%.1f stt_model_ms=%.1f openai_ms=%.1f "
+                    "tts_wall_ms=%.1f tts_model_ms=%.1f playback_ms=%.1f"
+                ),
+                command_count,
+                utterance_count,
+                (perf_counter() - utterance_started) * 1000.0,
+                stt_wall_ms,
+                transcript.latency_ms,
+                openai_wall_ms,
+                tts_wall_ms,
+                speech.latency_ms,
+                playback_ms,
+            )
+            if max_commands and command_count >= max_commands:
+                logger.info("wake_max_commands_reached turns=%d", command_count)
+                break
+            ui.status("listening", f"completed turn {command_count}")
+    except KeyboardInterrupt:
+        logger.info("wake_keyboard_interrupt")
+        ui.status("stopping", "keyboard interrupt")
+    finally:
+        close = getattr(locals().get("chunks", None), "close", None)
+        if close is not None:
+            close()
+        ui.stop()
+
+    logger.info(
+        "wake_loop_finished utterances=%d commands=%d",
+        locals().get("utterance_count", 0),
+        locals().get("command_count", 0),
+    )
     return 0
 
 

@@ -41,7 +41,7 @@ class WakeCommandRouter:
         if match is None:
             return WakeRouterEvent(kind="idle", transcript=transcript)
 
-        command = self._extract_after_wake(transcript, match.phrase)
+        command = self._extract_after_wake(transcript, match)
         if command:
             return WakeRouterEvent(
                 kind="command_ready",
@@ -54,10 +54,12 @@ class WakeCommandRouter:
         return WakeRouterEvent(kind="wake_detected", transcript=transcript, match=match)
 
     @staticmethod
-    def _extract_after_wake(transcript: str, phrase: str) -> str:
+    def _extract_after_wake(transcript: str, match: WakeMatch) -> str:
+        if match.transcript_end_char is not None:
+            return transcript[match.transcript_end_char :].lstrip(" \t\r\n,.;:!?-")
+
         normalized = normalize_text(transcript)
-        idx = normalized.find(phrase)
+        idx = normalized.find(match.phrase)
         if idx < 0:
             return ""
-        return normalized[idx + len(phrase) :].strip()
-
+        return normalized[idx + len(match.phrase) :].strip()

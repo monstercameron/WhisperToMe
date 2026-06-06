@@ -34,3 +34,6 @@ class SynthesizedSpeech:
     samples: FloatArray
     sample_rate: int
 
+    @property
+    def duration_ms(self) -> int:
+        return int((len(self.samples) / self.sample_rate) * 1000)

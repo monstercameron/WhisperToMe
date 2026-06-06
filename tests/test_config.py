@@ -47,6 +47,7 @@ class ConfigTests(unittest.TestCase):
             old_stt_max = os.environ.pop("WHISPERTOME_STT_MAX_TOKENS", None)
             old_stt_variant = os.environ.pop("WHISPERTOME_STT_ONNX_VARIANT", None)
             old_stt_prompt = os.environ.pop("WHISPERTOME_STT_PROMPT", None)
+            old_speech_end = os.environ.pop("WHISPERTOME_SPEECH_END_MS", None)
             try:
                 config = load_config(Path(tmp), require_openai_key=False)
             finally:
@@ -58,6 +59,8 @@ class ConfigTests(unittest.TestCase):
                     os.environ["WHISPERTOME_STT_ONNX_VARIANT"] = old_stt_variant
                 if old_stt_prompt is not None:
                     os.environ["WHISPERTOME_STT_PROMPT"] = old_stt_prompt
+                if old_speech_end is not None:
+                    os.environ["WHISPERTOME_SPEECH_END_MS"] = old_speech_end
 
             self.assertEqual(config.openai.max_output_tokens, 64)
             self.assertEqual(config.stt.backend, "qai_whisper")
@@ -76,6 +79,7 @@ class ConfigTests(unittest.TestCase):
                 / "whisper_small-precompiled_qnn_onnx-float-qualcomm_snapdragon_x2_elite",
             )
             self.assertEqual(config.audio.pre_roll_ms, 600)
+            self.assertEqual(config.audio.speech_end_ms, 1200)
 
 
 if __name__ == "__main__":

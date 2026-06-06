@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import unittest
 import logging
+import tempfile
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,6 +12,7 @@ import numpy as np
 from whispertome.audio.types import AudioBuffer
 from whispertome.cli import (
     FallbackTextToSpeechModel,
+    apply_cli_overrides,
     build_parser,
     prepare_stt_model,
     profile_audio,
@@ -18,6 +20,7 @@ from whispertome.cli import (
     should_prefer_debug_stt,
 )
 from whispertome.audio.types import SynthesizedSpeech
+from whispertome.config import load_config
 from whispertome.errors import WhisperToMeError
 from whispertome.tts.base import SpeechSynthesisResult, TextToSpeechModel
 
@@ -60,6 +63,21 @@ class CliTests(unittest.TestCase):
         self.assertTrue(log_file.name.startswith("demo-"))
         self.assertEqual(log_file.suffix, ".log")
 
+    def test_run_gets_default_log_file_under_project_root(self) -> None:
+        project_root = Path("C:/project")
+        args = SimpleNamespace(
+            command="run",
+            project_root=project_root,
+            log_file=None,
+        )
+
+        log_file = resolve_log_file(args)
+
+        assert log_file is not None
+        self.assertEqual(log_file.parent, project_root / "artifacts" / "logs")
+        self.assertTrue(log_file.name.startswith("run-"))
+        self.assertEqual(log_file.suffix, ".log")
+
     def test_relative_log_file_is_resolved_under_project_root(self) -> None:
         project_root = Path("C:/project")
         args = SimpleNamespace(
@@ -89,6 +107,74 @@ class CliTests(unittest.TestCase):
         self.assertTrue(args.allow_non_npu)
         self.assertEqual(args.record_ms, 10000)
         self.assertFalse(args.no_warmup)
+
+    def test_run_accepts_wake_loop_debug_options(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "run",
+                "--wake",
+                "computer",
+                "--allow-non-npu",
+                "--save-audio",
+                "--turns",
+                "2",
+                "--speech-end-ms",
+                "1200",
+                "--tui",
+                "--tui-lines",
+                "6",
+            ]
+        )
+
+        self.assertEqual(args.wake_phrases, ["computer"])
+        self.assertTrue(args.allow_non_npu)
+        self.assertTrue(args.save_audio)
+        self.assertEqual(args.turns, 2)
+        self.assertEqual(args.speech_end_ms, 1200)
+        self.assertTrue(args.tui)
+        self.assertEqual(args.tui_lines, 6)
+        self.assertFalse(args.no_warmup)
+
+    def test_cli_can_override_speech_end_ms(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(Path(tmp), require_openai_key=False)
+
+            updated = apply_cli_overrides(
+                config,
+                SimpleNamespace(wake_phrases=None, speech_end_ms=1500),
+            )
+
+        self.assertEqual(updated.audio.speech_end_ms, 1500)
+
+    def test_cli_rejects_invalid_speech_end_ms(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(Path(tmp), require_openai_key=False)
+
+            with self.assertRaisesRegex(WhisperToMeError, "speech-end-ms"):
+                apply_cli_overrides(
+                    config,
+                    SimpleNamespace(wake_phrases=None, speech_end_ms=0),
+                )
+
+    def test_run_rejects_invalid_tui_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(Path(tmp), require_openai_key=False)
+
+            with self.assertRaisesRegex(WhisperToMeError, "tui-lines"):
+                from whispertome.cli import run_wake_loop
+
+                run_wake_loop(
+                    config,
+                    max_commands=0,
+                    allow_non_npu=False,
+                    save_audio=False,
+                    play=False,
+                    warmup=False,
+                    min_speech_ms=0,
+                    vad_threshold=None,
+                    use_tui=False,
+                    tui_lines=11,
+                )
 
     def test_allow_non_npu_keeps_qai_whisper_on_npu(self) -> None:
         config = SimpleNamespace(stt=SimpleNamespace(backend="qai_whisper"))

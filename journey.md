@@ -198,3 +198,54 @@ Commit: `7e3e19f` (`Milestone: initial voice assistant scaffold`)
 
 - Keep the current local latency target focused on hot model reuse and short spoken replies.
 - Treat OpenAI streaming or Realtime/WebSocket as the next architectural step if time-to-first-audio becomes the main blocker.
+
+## Milestone 8: Wake Word Detection Hardening
+
+### Wins
+
+- Reworked wake detection from whole-window string matching to token-window matching.
+- Added fuzzy matching against candidate token spans instead of comparing one phrase to the entire transcript history.
+- Prevented stale wake phrases from re-triggering when the old phrase remains in the sliding window but the current utterance does not participate in the match.
+- Added span metadata to wake matches so the router can preserve original command text after the wake phrase.
+- Supported wake phrases split across adjacent STT utterances, such as `whisper` followed by `to me open diagnostics`.
+- Added a logged continuous `run` wake loop for manual testing with QNN STT, wake routing, OpenAI, TTS, playback, and optional saved utterance WAVs.
+- Increased the default end-of-speech silence from 700 ms to 1200 ms after manual testing cut off a sentence with a short thinking pause.
+- Added `--speech-end-ms` so the pause can be tuned live without editing `.env`.
+- Reviewed wake-loop logs after TTS appeared to skip; found TTS was not failing, the wake router failed to emit `wake_command` for long utterances where `computer` was at the start.
+- Fixed the detector to check the previous context plus the full current transcript before trimming to the long-term sliding window.
+- Added tests for fuzzy wake extraction, stale-window protection, split-utterance wake phrases, parser options, and run log defaults.
+
+### Losses
+
+- This is still STT-derived wake detection, so wake reliability depends on Whisper hearing the wake phrase correctly.
+- Continuous local STT costs one QNN Whisper inference for each VAD-delimited speech utterance, even when the user is not talking to the assistant.
+- A longer speech-end pause improves sentence capture but adds about 500 ms before STT starts after each user utterance.
+- The audible wake loop still needs explicit debug TTS until a QNN-compatible TTS artifact exists.
+
+### Decisions
+
+- Keep arbitrary wake phrases as plain text configured through `.env` or repeated `--wake` flags.
+- Prefer robust transcript-window matching over a separate wake-word model for now because it stays model-agnostic and runs on the verified STT path.
+- Save utterance audio during manual wake tests so missed or false wake events can be traced back to the exact STT input.
+
+## Milestone 9: Terminal UI Design
+
+### Wins
+
+- Added an optional `run --tui` terminal UI without introducing a new dependency.
+- Built a central polygonal ASCII visualization that animates continuously and pulses with input activity.
+- Added live input and output text panels for the latest transcript/command and assistant response.
+- Added a bounded 1-10 line system stream for state transitions such as listening, speech captured, transcribing, wake detected, contacting OpenAI, running TTS, and playing speech.
+- Routed wake-loop events into the UI while keeping detailed logs in the run log file.
+- Suppressed console log streaming while the TUI is active so the visualization is not corrupted.
+- Added unit tests for stream bounds, status rendering, polygon markers, and CLI options.
+
+### Losses
+
+- This is a terminal-rendered visualization, not a full Textual/curses app yet; resizing and high-frame animation are intentionally simple.
+- PowerShell/terminal ANSI support is assumed for the live visual mode.
+
+### Decisions
+
+- Keep the TUI optional via `--tui` so plain log-oriented runs remain available.
+- Keep the renderer pure Python and event-driven so the voice loop does not depend on UI internals.

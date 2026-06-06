@@ -158,11 +158,33 @@ Start the live loop:
 whispertome --project-root C:\Users\mreca\Desktop\whispertome run
 ```
 
+That command is strict NPU-only. For manual wake-word testing with audible TTS while the TTS NPU artifact is still blocked, use the explicit debug TTS override:
+
+```powershell
+whispertome --project-root C:\Users\mreca\Desktop\whispertome run --allow-non-npu --save-audio
+```
+
+The `run` command continuously segments microphone speech with VAD, transcribes each utterance with STT, checks a sliding transcript window for a wake phrase, and only sends a command to OpenAI after wake detection. It writes a log under `artifacts\logs\run-*.log`; `--save-audio` writes each STT utterance and assistant WAV under `artifacts\wake\...`.
+
+For the live terminal UI, add `--tui`:
+
+```powershell
+whispertome --project-root C:\Users\mreca\Desktop\whispertome run --allow-non-npu --save-audio --wake "computer" --speech-end-ms 1200 --tui
+```
+
+The TUI shows a central animated polygon whose pulse follows input activity, live input/output text panels, and a bounded 1-10 line system stream for states like `listening`, `wake detected`, `transcribing`, `contacting openai`, `running tts`, and `playing speech`. Use `--tui-lines 6` to change the stream height.
+
+The default end-of-speech silence is `WHISPERTOME_SPEECH_END_MS=1200`, which gives room for short thinking pauses, "um", and "ah" without cutting a sentence in half. For live tuning:
+
+```powershell
+whispertome --project-root C:\Users\mreca\Desktop\whispertome run --allow-non-npu --save-audio --wake "computer" --speech-end-ms 1200
+```
+
 Override wake phrases at runtime with repeated `--wake` flags:
 
 ```powershell
 whispertome --project-root C:\Users\mreca\Desktop\whispertome run --wake "computer"
-whispertome --project-root C:\Users\mreca\Desktop\whispertome run --wake "computer" --wake "hello dashboard"
+whispertome --project-root C:\Users\mreca\Desktop\whispertome run --allow-non-npu --save-audio --wake "computer" --wake "hello dashboard"
 ```
 
 Test wake phrase behavior without a microphone, model files, or OpenAI calls:
@@ -172,7 +194,7 @@ whispertome --project-root C:\Users\mreca\Desktop\whispertome test-wake --wake "
 whispertome --project-root C:\Users\mreca\Desktop\whispertome test-wake --wake "whisper to me" "whisper to me" "summarize my calendar"
 ```
 
-Each `test-wake` argument is treated as one speech-pause-delimited utterance. In the live loop, VAD decides those utterance boundaries from microphone audio.
+Each `test-wake` argument is treated as one speech-pause-delimited utterance. In the live loop, VAD decides those utterance boundaries from microphone audio. Wake matching is token-window based, supports phrases split across adjacent STT utterances, ignores stale matches that are only in the old window, and preserves the original command text after the wake phrase when possible.
 
 Test TTS model initialization and WAV generation:
 
@@ -258,6 +280,7 @@ Implemented:
 - Continuous STT-oriented voice loop.
 - Sliding transcript wake phrase detection with arbitrary wake phrases.
 - Speech-pause-delimited command capture after wake detection.
+- Token-window wake matching with fuzzy spans, stale-window protection, and original command-text extraction.
 - OpenAI Responses API client with a dictation-aware system prompt and stateful response chaining.
 - Strict NPU-only ONNX Runtime provider selection.
 - `doctor` command for safe config and runtime checks.
@@ -267,6 +290,8 @@ Implemented:
 - `test-stt` command for WAV-file and short microphone transcription checks.
 - `test-openai` command for Responses API smoke tests.
 - `demo` command for microphone -> STT -> OpenAI -> TTS -> speaker conversation testing with per-run logs.
+- `run` command for the continuous wake phrase loop with per-run logs and optional utterance audio capture.
+- Optional `run --tui` terminal UI with central polygon animation, input/output text, and a bounded system state stream.
 - Speech-pause-delimited demo recording with stage-level profiling and clipping warnings.
 - Whisper ONNX split encoder/decoder adapter with Hugging Face feature extraction and tokenizer decoding.
 - Kokoro ONNX TTS adapter using the real `kokoro-onnx` tokenizer, phonemizer, voices, and injected NPU-only ONNX session.
