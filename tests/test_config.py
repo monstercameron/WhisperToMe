@@ -93,6 +93,13 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("System control tools", config.openai.system_prompt)
             self.assertIn("directly asks", config.openai.system_prompt)
             self.assertIn("volume and brightness to 0-100", config.openai.system_prompt)
+            self.assertIn("assistant-window minimize tool", config.openai.system_prompt)
+            self.assertIn(
+                "get the assistant/app/window out of the way",
+                config.openai.system_prompt,
+            )
+            self.assertIn("we're done", config.openai.system_prompt)
+            self.assertIn("system tray", config.openai.system_prompt)
             self.assertEqual(config.stt.backend, "qai_whisper")
             self.assertEqual(config.stt.max_tokens, 64)
             self.assertEqual(config.stt.onnx_variant, "fp32")

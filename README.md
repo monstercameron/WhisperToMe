@@ -178,6 +178,14 @@ whispertome --project-root C:\Users\mreca\Desktop\whispertome run --allow-non-np
 
 The TUI opens with a full-screen NPU boot animation while the local STT and TTS models warm up. Once the voice stack is ready, it switches to the normal central animated polygon whose pulse follows input activity, live input/output text panels, and a bounded 1-10 line system stream for states like `listening`, `wake detected`, `transcribing`, `contacting openai`, `running tts`, and `playing speech`. UI state changes wake the renderer immediately so wake/interruption animations do not wait for the next fixed tick. Use `--tui-lines 6` to change the stream height.
 
+For the first desktop-host integration, use `desktop`:
+
+```powershell
+whispertome --project-root C:\Users\mreca\Desktop\whispertome desktop --allow-non-npu --save-audio --wake "computer" --speech-end-ms 1200
+```
+
+The desktop command opens an owned fixed-size `WhisperToMe` Windows window at 800x600 and embeds the existing terminal TUI inside it. The host passes a compact character viewport to the child voice loop so the polygon, input/output panels, optional code viewport, and newest system-stream lines fit the shell without bottom clipping. It also creates a Windows tray icon with a right-click menu for `Show Window`, `Stop Listening`, and `Close Program`. Wake detection writes a host signal so the desktop window restores, centers, and comes forward when the wake word is triggered. Voice requests such as "minimize yourself", "hide", or "we're done talking for now" route through the host and hide the window to the system tray instead of minimizing it to the taskbar; the tray `Show Window` command or the next wake activation restores it. The host process writes `desktop-*` logs, while the embedded voice loop still writes the normal `run-*` logs. Stop and window close request a cooperative child shutdown first, then fall back to process-tree termination only if the voice loop does not exit within the grace window. This first host uses the built-in Tk window stack and an ANSI terminal-frame renderer; later native shell work can replace the terminal surface with richer panels without changing the voice loop.
+
 When the TUI is enabled, the wake loop also runs an interim wake preview during active speech. This is not true Whisper token streaming; the local Whisper/QNN path is still batch STT. Instead, the app periodically transcribes a rolling audio window while the user is still speaking and uses that interim transcript only to update the TUI wake state sooner. The final pause-delimited transcript remains the source of truth for command execution.
 
 The live wake loop streams OpenAI response deltas by default. Spoken-safe sentence chunks are sent to TTS as soon as they are complete, and audio chunks play in order while later tokens and TTS chunks are still being produced. Use `--no-stream-tts` to fall back to the older batch path for debugging.
@@ -285,8 +293,9 @@ It also exposes narrow Windows system-control tools on direct user request:
 
 - `system_volume_get`, `system_volume_set`, `system_volume_change`, and `system_volume_mute`.
 - `screen_brightness_get`, `screen_brightness_set`, and `screen_brightness_change`.
+- `agent_window_minimize`.
 
-Volume uses Windows Core Audio through `pycaw`. Agent volume tools control the default speaker endpoint; wake ducking controls per-app audio sessions so browser/background audio can drop without lowering the assistant's own TTS. Built-in screen brightness uses Windows WMI/CIM classes; external monitor brightness may not be available unless Windows exposes it through those classes. The prompt tells the model to clamp values to 0-100, use small relative changes for vague commands, and confirm briefly.
+Volume uses Windows Core Audio through `pycaw`. Agent volume tools control the default speaker endpoint; wake ducking controls per-app audio sessions so browser/background audio can drop without lowering the assistant's own TTS. Built-in screen brightness uses Windows WMI/CIM classes; external monitor brightness may not be available unless Windows exposes it through those classes. The assistant-window minimize tool targets the owned desktop host window passed to the voice loop by process ID, so requests like "minimize yourself" or "we're done talking" affect only WhisperToMe and hide it to the system tray. The prompt tells the model to clamp values to 0-100, use small relative changes for vague commands, and confirm briefly.
 
 Organizer data is stored locally under ignored `artifacts\organizer\organizer.sqlite`. If an older `artifacts\organizer\store.json` exists, it is migrated into SQLite once and left in place as a legacy artifact. Preferences are upserted by stable keys such as `preferred_name` or `units`; only compact active preference sentences are injected into the system prompt, while raw user wording can be stored as evidence for debugging. The TUI system stream shows `using tool` while a tool is running, and logs include `wake_agent_tool`, `demo_agent_tool`, or `openai_agent_tool` entries with the tool name, arguments, result, and latency.
 
@@ -356,6 +365,7 @@ Implemented:
 - `demo` command for microphone -> STT -> OpenAI -> TTS -> speaker conversation testing with per-run logs.
 - `run` command for the continuous wake phrase loop with per-run logs and optional utterance audio capture.
 - Optional `run --tui` terminal UI with a startup NPU boot animation, central polygon animation, input/output text, and a bounded system state stream.
+- `desktop` command that opens a first-class Windows window and hosts the existing terminal TUI process.
 - Markdown-aware TTS text preparation that suppresses fenced and obvious unfenced code blocks and renders script/code blocks in the TUI.
 - Interruptible assistant playback with concurrent STT wake detection during spoken output.
 - Streaming OpenAI deltas into sentence-level TTS chunks for lower perceived assistant latency.

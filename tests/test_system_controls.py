@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
 from whispertome.agent.tools import AgentToolRegistry
 from whispertome.system.tools import build_system_control_tools
-from whispertome.system.windows import SystemVolumeDucker, WindowsBackgroundAudioDucker
+from whispertome.system.windows import (
+    DESKTOP_WINDOW_COMMAND_FILE_ENV,
+    SystemVolumeDucker,
+    WindowActionResult,
+    WindowsAgentWindowController,
+    WindowsBackgroundAudioDucker,
+)
 
 
 class FakeVolumeController:
@@ -39,6 +48,21 @@ class FakeBrightnessController:
     def set_brightness_percent(self, percent: int) -> list[int]:
         self.levels = [percent for _ in self.levels]
         return self.levels
+
+
+class FakeWindowController:
+    def __init__(self, *, result: WindowActionResult | None = None) -> None:
+        self.calls = 0
+        self.result = result or WindowActionResult(
+            ok=True,
+            process_id=123,
+            window_title="WhisperToMe",
+            hwnd=456,
+        )
+
+    def minimize_agent_window(self) -> WindowActionResult:
+        self.calls += 1
+        return self.result
 
 
 class FakeAudioSession:
@@ -77,10 +101,12 @@ class SystemControlToolTests(unittest.TestCase):
     def test_volume_and_brightness_tools_clamp_and_change_values(self) -> None:
         volume = FakeVolumeController(volume=50)
         brightness = FakeBrightnessController(levels=[40, 60])
+        window = FakeWindowController()
         registry = AgentToolRegistry(
             build_system_control_tools(
                 volume_controller=volume,
                 brightness_controller=brightness,
+                window_controller=window,
             )
         )
 
@@ -109,6 +135,48 @@ class SystemControlToolTests(unittest.TestCase):
             ],
             [0, 0],
         )
+        minimize = registry.execute("agent_window_minimize", {}).output
+        self.assertTrue(minimize["ok"])
+        self.assertEqual(minimize["window_title"], "WhisperToMe")
+        self.assertEqual(window.calls, 1)
+
+    def test_agent_window_minimize_reports_unavailable_window(self) -> None:
+        window = FakeWindowController(
+            result=WindowActionResult(
+                ok=False,
+                process_id=123,
+                window_title="WhisperToMe",
+                hwnd=None,
+                reason="No window",
+            )
+        )
+        registry = AgentToolRegistry(build_system_control_tools(window_controller=window))
+
+        output = registry.execute("agent_window_minimize", {}).output
+
+        self.assertFalse(output["ok"])
+        self.assertEqual(output["reason"], "No window")
+
+    def test_agent_window_minimize_writes_desktop_host_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            command_file = Path(tmp) / "window.command"
+            old_command_file = os.environ.get(DESKTOP_WINDOW_COMMAND_FILE_ENV)
+            os.environ[DESKTOP_WINDOW_COMMAND_FILE_ENV] = str(command_file)
+            try:
+                controller = WindowsAgentWindowController(
+                    target_pid=123,
+                    title="WhisperToMe",
+                )
+                result = controller.minimize_agent_window()
+            finally:
+                if old_command_file is None:
+                    os.environ.pop(DESKTOP_WINDOW_COMMAND_FILE_ENV, None)
+                else:
+                    os.environ[DESKTOP_WINDOW_COMMAND_FILE_ENV] = old_command_file
+
+            self.assertTrue(result.ok)
+            self.assertIsNone(result.hwnd)
+            self.assertEqual(command_file.read_text(encoding="utf-8"), "hide_to_tray\n")
 
     def test_volume_ducker_lowers_then_restores_previous_volume(self) -> None:
         volume = FakeVolumeController(volume=80)

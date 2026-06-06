@@ -45,6 +45,24 @@ class TerminalUiTests(unittest.TestCase):
         self.assertIn("Working on it.", frame)
         self.assertIn("using tools", frame)
 
+    def test_render_frame_fits_800_by_600_desktop_viewport(self) -> None:
+        state = TerminalUiState(max_lines=10)
+        state.set_status("listening", "waiting for computer")
+        state.set_user("Computer, check my next important items and keep it short.")
+        state.set_assistant("Checking your organizer now.")
+        for index in range(10):
+            state.add_line(f"event {index}")
+
+        frame = render_frame(state, width=87, height=29, frame=8)
+        lines = frame.splitlines()
+
+        self.assertLessEqual(len(lines), 29)
+        self.assertTrue(all(strip_ansi_len(line) <= 87 for line in lines))
+        self.assertIn("INPUT", frame)
+        self.assertIn("OUTPUT", frame)
+        self.assertIn("SYSTEM STREAM", frame)
+        self.assertIn("event 9", frame)
+
     def test_render_frame_contains_code_block_view(self) -> None:
         state = TerminalUiState(max_lines=3)
         state.set_code_block("script", "line one\nline two")
@@ -54,6 +72,23 @@ class TerminalUiTests(unittest.TestCase):
         self.assertIn("SCRIPT VIEW", frame)
         self.assertIn("line one", frame)
         self.assertIn("line two", frame)
+
+    def test_render_frame_with_code_fits_800_by_600_desktop_viewport(self) -> None:
+        state = TerminalUiState(max_lines=10)
+        state.set_status("playing speech", "tts")
+        state.set_user("Computer, give me a small script.")
+        state.set_assistant("Here is one script.")
+        state.set_code_block("script", "\n".join(f"line {index}" for index in range(12)))
+        for index in range(10):
+            state.add_line(f"tool event {index}")
+
+        frame = render_frame(state, width=87, height=29, frame=18)
+        lines = frame.splitlines()
+
+        self.assertLessEqual(len(lines), 29)
+        self.assertTrue(all(strip_ansi_len(line) <= 87 for line in lines))
+        self.assertIn("SCRIPT VIEW", frame)
+        self.assertIn("SYSTEM STREAM", frame)
 
     def test_render_frame_uses_boot_scene_during_initialization(self) -> None:
         state = TerminalUiState(max_lines=3)

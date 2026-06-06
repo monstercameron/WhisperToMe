@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -58,6 +60,39 @@ class CommandTurnResult:
 
 def _fmt_ms(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.1f}"
+
+
+def _resolve_stop_file(project_root: Path, stop_file: Path | None) -> Path | None:
+    return _resolve_signal_file(project_root, stop_file)
+
+
+def _resolve_signal_file(project_root: Path, signal_file: Path | None) -> Path | None:
+    if signal_file is None:
+        return None
+    path = signal_file.expanduser()
+    if not path.is_absolute():
+        path = project_root / path
+    return path
+
+
+def _write_signal_file(path: Path | None, text: str) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _safe_unlink(path: Path | None) -> None:
+    if path is None:
+        return
+    path.unlink(missing_ok=True)
+
+
+def _chunks_until_stop_requested(chunks, stop_requested: Callable[[], bool]):  # type: ignore[no-untyped-def]
+    for chunk in chunks:
+        if stop_requested():
+            return
+        yield chunk
 
 
 def _queued_interruption_command(interruption: Any | None) -> QueuedInterruptionCommand | None:
@@ -189,6 +224,31 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Start the live voice loop.")
     add_wake_args(run_parser)
     add_live_loop_args(run_parser)
+
+    desktop_parser = subparsers.add_parser(
+        "desktop",
+        help="Open a first-class desktop window hosting the live TUI.",
+    )
+    add_wake_args(desktop_parser)
+    add_live_loop_args(desktop_parser, include_tui=False)
+    desktop_parser.add_argument(
+        "--window-width",
+        type=int,
+        default=800,
+        help="Initial desktop window width in pixels.",
+    )
+    desktop_parser.add_argument(
+        "--window-height",
+        type=int,
+        default=600,
+        help="Initial desktop window height in pixels.",
+    )
+    desktop_parser.add_argument(
+        "--font-size",
+        type=int,
+        default=10,
+        help="Terminal font size inside the desktop window.",
+    )
 
     demo_parser = subparsers.add_parser(
         "demo",
@@ -346,7 +406,7 @@ def add_wake_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def add_live_loop_args(parser: argparse.ArgumentParser) -> None:
+def add_live_loop_args(parser: argparse.ArgumentParser, *, include_tui: bool = True) -> None:
     parser.add_argument(
         "--turns",
         type=int,
@@ -396,16 +456,29 @@ def add_live_loop_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Use the older batch OpenAI -> TTS path instead of streaming sentence chunks.",
     )
-    parser.add_argument(
-        "--tui",
-        action="store_true",
-        help="Render a live terminal UI instead of console log lines.",
-    )
+    if include_tui:
+        parser.add_argument(
+            "--tui",
+            action="store_true",
+            help="Render a live terminal UI instead of console log lines.",
+        )
     parser.add_argument(
         "--tui-lines",
         type=int,
         default=10,
         help="Number of system stream lines to show in the TUI, from 1 to 10.",
+    )
+    parser.add_argument(
+        "--stop-file",
+        type=Path,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--wake-event-file",
+        type=Path,
+        default=None,
+        help=argparse.SUPPRESS,
     )
 
 
@@ -459,7 +532,15 @@ def main(argv: list[str] | None = None) -> int:
                 use_tui=args.tui,
                 tui_lines=args.tui_lines,
                 stream_tts=not args.no_stream_tts,
+                stop_file=args.stop_file,
+                wake_event_file=args.wake_event_file,
             )
+        if args.command == "desktop":
+            config = apply_cli_overrides(
+                load_config(args.project_root, require_openai_key=True),
+                args,
+            )
+            return run_desktop(config, args)
         if args.command == "demo":
             config = apply_cli_overrides(
                 load_config(args.project_root, require_openai_key=True),
@@ -523,7 +604,7 @@ def resolve_log_file(args: argparse.Namespace) -> Path | None:
             path = args.project_root / path
         return path
 
-    if args.command in {"demo", "run"}:
+    if args.command in {"demo", "desktop", "run"}:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         return args.project_root / "artifacts" / "logs" / f"{args.command}-{stamp}.log"
 
@@ -588,6 +669,83 @@ def run_doctor(config: AppConfig) -> int:
     return 0
 
 
+def run_desktop(config: AppConfig, args: argparse.Namespace) -> int:
+    if args.window_width < 640:
+        raise WhisperToMeError("window-width must be at least 640")
+    if args.window_height < 480:
+        raise WhisperToMeError("window-height must be at least 480")
+    if args.font_size < 8:
+        raise WhisperToMeError("font-size must be at least 8")
+    if args.tui_lines < 1 or args.tui_lines > 10:
+        raise WhisperToMeError("tui-lines must be between 1 and 10")
+
+    from whispertome.desktop.host import (
+        DesktopHostConfig,
+        DesktopTerminalHost,
+        VoiceLoopLaunchOptions,
+        build_voice_loop_command,
+    )
+
+    desktop_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stop_file = (
+        config.project_root
+        / "artifacts"
+        / "desktop"
+        / f"stop-{desktop_stamp}.signal"
+    )
+    wake_event_file = (
+        config.project_root
+        / "artifacts"
+        / "desktop"
+        / f"wake-{desktop_stamp}.signal"
+    )
+    window_command_file = (
+        config.project_root
+        / "artifacts"
+        / "desktop"
+        / f"window-{desktop_stamp}.command"
+    )
+    stop_file.unlink(missing_ok=True)
+    wake_event_file.unlink(missing_ok=True)
+    window_command_file.unlink(missing_ok=True)
+    logging.getLogger(__name__).info(
+        "desktop_signal_files stop_file=%s wake_event_file=%s window_command_file=%s",
+        stop_file,
+        wake_event_file,
+        window_command_file,
+    )
+    options = VoiceLoopLaunchOptions(
+        project_root=config.project_root,
+        wake_phrases=tuple(args.wake_phrases or ()),
+        max_commands=args.turns,
+        allow_non_npu=args.allow_non_npu,
+        save_audio=args.save_audio,
+        warmup=not args.no_warmup,
+        min_speech_ms=args.min_speech_ms,
+        vad_threshold=args.vad_threshold,
+        speech_end_ms=args.speech_end_ms,
+        play=not args.no_play,
+        stream_tts=not args.no_stream_tts,
+        tui_lines=args.tui_lines,
+        stop_file=stop_file,
+        wake_event_file=wake_event_file,
+    )
+    command = build_voice_loop_command(sys.executable, options)
+    logging.getLogger(__name__).info("desktop_child_command=%r", command)
+    return DesktopTerminalHost(
+        DesktopHostConfig(
+            command=command,
+            cwd=config.project_root,
+            width=args.window_width,
+            height=args.window_height,
+            font_size=args.font_size,
+            stop_file=stop_file,
+            wake_event_file=wake_event_file,
+            window_command_file=window_command_file,
+        )
+    ).run()
+
+
 def run_test_wake(config: AppConfig, utterances: list[str]) -> int:
     logger = logging.getLogger(__name__)
     router = WakeCommandRouter(SlidingWakeDetector(config.wake))
@@ -623,6 +781,8 @@ def run_wake_loop(
     use_tui: bool = False,
     tui_lines: int = 10,
     stream_tts: bool = True,
+    stop_file: Path | None = None,
+    wake_event_file: Path | None = None,
 ) -> int:
     if max_commands < 0:
         raise WhisperToMeError("turns must be greater than or equal to 0")
@@ -635,6 +795,21 @@ def run_wake_loop(
     active_vad_threshold = (
         config.audio.vad_rms_threshold if vad_threshold is None else vad_threshold
     )
+    stop_path = _resolve_stop_file(config.project_root, stop_file)
+    wake_event_path = _resolve_signal_file(config.project_root, wake_event_file)
+
+    def stop_requested() -> bool:
+        return stop_path is not None and stop_path.exists()
+
+    def signal_wake_event(reason: str) -> None:
+        try:
+            _write_signal_file(
+                wake_event_path,
+                f"{datetime.now().astimezone().isoformat()} {reason}\n",
+            )
+        except Exception as exc:
+            logger.warning("wake_event_signal_failed reason=%s error=%s", reason, exc)
+
     if allow_non_npu:
         logger.warning(
             "wake_debug_non_npu_enabled=true production_npu_policy_unchanged=true"
@@ -776,6 +951,11 @@ def run_wake_loop(
         utterance_count = 0
         command_count = 0
         chunks = MicrophoneInput(config.audio).chunks()
+
+        def on_interim_wake_detected(_result: Any) -> None:
+            signal_wake_event("interim_wake_detected")
+            duck_background_audio("interim_wake_detected")
+
         interim_preview = (
             InterimWakePreview(
                 config=config,
@@ -784,15 +964,13 @@ def run_wake_loop(
                 logger=logger,
                 status_callback=ui.status,
                 line_callback=ui.line,
-                on_wake_detected=lambda _result: duck_background_audio(
-                    "interim_wake_detected"
-                ),
+                on_wake_detected=on_interim_wake_detected,
             )
             if use_tui
             else None
         )
         utterances = segmenter.utterances(
-            chunks,
+            _chunks_until_stop_requested(chunks, stop_requested),
             on_speech_start=(
                 interim_preview.start if interim_preview is not None else None
             ),
@@ -860,6 +1038,7 @@ def run_wake_loop(
                 )
 
             def on_playback_wake_detected(_interruption: Any) -> None:
+                signal_wake_event("playback_wake_detected")
                 duck_background_audio(
                     "playback_wake_confirmed",
                     turn_number=command_count,
@@ -1194,6 +1373,10 @@ def run_wake_loop(
             return CommandTurnResult(queued_command=queued_command)
 
         for utterance in utterances:
+            if stop_requested():
+                logger.info("wake_external_stop_requested phase=before_utterance")
+                ui.status("stopping", "desktop stop requested")
+                break
             utterance_count += 1
             utterance_started = perf_counter()
             audio_profile = profile_audio(
@@ -1269,6 +1452,7 @@ def run_wake_loop(
                     event.match.transcript_window,
                 )
                 ui.status("wake detected", event.match.phrase)
+                signal_wake_event("wake_detected")
                 duck_background_audio("wake_detected")
                 if not use_tui:
                     print("Wake detected. Listening for your command.")
@@ -1284,10 +1468,18 @@ def run_wake_loop(
                 stt_wall_ms=stt_wall_ms,
                 stt_latency_ms=transcript.latency_ms,
             )
+            if stop_requested():
+                logger.info("wake_external_stop_requested phase=after_turn")
+                ui.status("stopping", "desktop stop requested")
+                break
             if result.stop_requested:
                 break
 
             while result.queued_command is not None:
+                if stop_requested():
+                    logger.info("wake_external_stop_requested phase=barge_in_queue")
+                    ui.status("stopping", "desktop stop requested")
+                    break
                 queued = result.queued_command
                 if max_commands and command_count >= max_commands:
                     logger.info("wake_max_commands_reached turns=%d", command_count)
@@ -1323,10 +1515,14 @@ def run_wake_loop(
         logger.info("wake_keyboard_interrupt")
         ui.status("stopping", "keyboard interrupt")
     finally:
+        if stop_requested():
+            logger.info("wake_external_stop_requested phase=finally")
         close = getattr(locals().get("chunks", None), "close", None)
         if close is not None:
             close()
         restore_background_audio("wake_loop_finished")
+        _safe_unlink(stop_path)
+        _safe_unlink(wake_event_path)
         ui.stop()
 
     logger.info(

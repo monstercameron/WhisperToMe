@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from whispertome.audio.types import AudioBuffer
+from whispertome.audio.types import AudioBuffer, SynthesizedSpeech
 from whispertome.cli import (
     FallbackTextToSpeechModel,
     _queued_interruption_command,
@@ -20,7 +20,6 @@ from whispertome.cli import (
     resolve_log_file,
     should_prefer_debug_stt,
 )
-from whispertome.audio.types import SynthesizedSpeech
 from whispertome.config import load_config
 from whispertome.errors import WhisperToMeError
 from whispertome.tts.base import SpeechSynthesisResult, TextToSpeechModel

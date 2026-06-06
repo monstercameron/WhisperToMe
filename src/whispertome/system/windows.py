@@ -3,11 +3,18 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Lock
 from typing import Any, Protocol
 
 from whispertome.errors import WhisperToMeError
+
+DESKTOP_HOST_PID_ENV = "WHISPERTOME_DESKTOP_HOST_PID"
+DESKTOP_WINDOW_COMMAND_FILE_ENV = "WHISPERTOME_DESKTOP_WINDOW_COMMAND_FILE"
+DESKTOP_WINDOW_TITLE_ENV = "WHISPERTOME_DESKTOP_WINDOW_TITLE"
+DEFAULT_DESKTOP_WINDOW_TITLE = "WhisperToMe"
 
 
 class SystemControlError(WhisperToMeError):
@@ -30,6 +37,10 @@ class BrightnessController(Protocol):
     def set_brightness_percent(self, percent: int) -> list[int]: ...
 
 
+class AgentWindowController(Protocol):
+    def minimize_agent_window(self) -> WindowActionResult: ...
+
+
 class AudioSessionVolume(Protocol):
     pid: int | None
     process_name: str
@@ -42,6 +53,15 @@ class AudioSessionVolume(Protocol):
 
 class AudioSessionController(Protocol):
     def get_sessions(self) -> list[AudioSessionVolume]: ...
+
+
+@dataclass(frozen=True)
+class WindowActionResult:
+    ok: bool
+    process_id: int | None
+    window_title: str | None
+    hwnd: int | None
+    reason: str | None = None
 
 
 class WindowsVolumeController:
@@ -168,6 +188,99 @@ class WindowsBrightnessController:
             "$methods.Count"
         )
         return self.get_brightness_levels()
+
+
+class WindowsAgentWindowController:
+    """Controls the owned WhisperToMe desktop host window."""
+
+    def __init__(
+        self,
+        *,
+        target_pid: int | None = None,
+        title: str | None = None,
+    ) -> None:
+        self._target_pid = target_pid if target_pid is not None else _env_pid()
+        self._title = title or os.environ.get(
+            DESKTOP_WINDOW_TITLE_ENV,
+            DEFAULT_DESKTOP_WINDOW_TITLE,
+        )
+        self._command_file = os.environ.get(DESKTOP_WINDOW_COMMAND_FILE_ENV)
+
+    def minimize_agent_window(self) -> WindowActionResult:
+        host_result = self._request_host_hide_to_tray()
+        if host_result is not None:
+            return host_result
+
+        if sys.platform != "win32":
+            return WindowActionResult(
+                ok=False,
+                process_id=self._target_pid,
+                window_title=self._title,
+                hwnd=None,
+                reason="Agent window control is only available on Windows",
+            )
+
+        window = _find_top_level_window(pid=self._target_pid, title=self._title)
+        if window is None:
+            target = (
+                f"pid {self._target_pid}"
+                if self._target_pid is not None
+                else f"title {self._title!r}"
+            )
+            return WindowActionResult(
+                ok=False,
+                process_id=self._target_pid,
+                window_title=self._title,
+                hwnd=None,
+                reason=f"No WhisperToMe desktop window found for {target}",
+            )
+
+        hwnd, pid, title = window
+        try:
+            import ctypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            sw_hide = 0
+            user32.ShowWindow(hwnd, sw_hide)
+            hidden = not bool(user32.IsWindowVisible(hwnd))
+        except Exception as exc:
+            return WindowActionResult(
+                ok=False,
+                process_id=pid,
+                window_title=title,
+                hwnd=hwnd,
+                reason=str(exc),
+            )
+
+        return WindowActionResult(
+            ok=hidden,
+            process_id=pid,
+            window_title=title,
+            hwnd=hwnd,
+            reason=None if hidden else "Windows did not report the window as hidden",
+        )
+
+    def _request_host_hide_to_tray(self) -> WindowActionResult | None:
+        if not self._command_file:
+            return None
+        try:
+            command_file = Path(self._command_file).expanduser()
+            command_file.parent.mkdir(parents=True, exist_ok=True)
+            command_file.write_text("hide_to_tray\n", encoding="utf-8")
+        except Exception as exc:
+            return WindowActionResult(
+                ok=False,
+                process_id=self._target_pid,
+                window_title=self._title,
+                hwnd=None,
+                reason=f"Could not request the desktop host to hide to tray: {exc}",
+            )
+        return WindowActionResult(
+            ok=True,
+            process_id=self._target_pid,
+            window_title=self._title,
+            hwnd=None,
+        )
 
 
 @dataclass(frozen=True)
@@ -496,3 +609,61 @@ def _run_powershell(command: str) -> str:
         error = completed.stderr.strip() or completed.stdout.strip() or "PowerShell command failed"
         raise SystemControlError(error)
     return completed.stdout.strip()
+
+
+def _env_pid() -> int | None:
+    raw = os.environ.get(DESKTOP_HOST_PID_ENV)
+    if not raw:
+        return None
+    try:
+        pid = int(raw)
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def _find_top_level_window(
+    *,
+    pid: int | None,
+    title: str,
+) -> tuple[int, int | None, str] | None:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    matches: list[tuple[int, int | None, str]] = []
+
+    enum_windows_proc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HWND,
+        wintypes.LPARAM,
+    )
+
+    @enum_windows_proc
+    def enum_window(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, length + 1)
+        window_title = buffer.value
+        process_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        if pid is not None:
+            if int(process_id.value) == pid:
+                matches.append((int(hwnd), int(process_id.value), window_title))
+            return True
+        if window_title == title:
+            matches.append((int(hwnd), int(process_id.value), window_title))
+        return True
+
+    user32.EnumWindows(enum_window, 0)
+    if not matches:
+        return None
+    if pid is not None:
+        for match in matches:
+            if match[2] == title:
+                return match
+    return matches[0]

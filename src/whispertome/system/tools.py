@@ -9,8 +9,11 @@ from whispertome.agent.tools import (
     object_schema,
 )
 from whispertome.system.windows import (
+    AgentWindowController,
     BrightnessController,
     VolumeController,
+    WindowActionResult,
+    WindowsAgentWindowController,
     WindowsBrightnessController,
     WindowsVolumeController,
     clamp_percent,
@@ -21,9 +24,11 @@ def build_system_control_tools(
     *,
     volume_controller: VolumeController | None = None,
     brightness_controller: BrightnessController | None = None,
+    window_controller: AgentWindowController | None = None,
 ) -> list[AgentTool]:
     volume = volume_controller or WindowsVolumeController()
     brightness = brightness_controller or WindowsBrightnessController()
+    window = window_controller or WindowsAgentWindowController()
     return [
         _system_volume_get(volume),
         _system_volume_set(volume),
@@ -32,6 +37,7 @@ def build_system_control_tools(
         _screen_brightness_get(brightness),
         _screen_brightness_set(brightness),
         _screen_brightness_change(brightness),
+        _agent_window_minimize(window),
     ]
 
 
@@ -155,6 +161,20 @@ def _screen_brightness_change(controller: BrightnessController) -> AgentTool:
     )
 
 
+def _agent_window_minimize(controller: AgentWindowController) -> AgentTool:
+    return AgentTool(
+        name="agent_window_minimize",
+        description=(
+            "Hide the WhisperToMe desktop assistant window to the system tray when the user "
+            "asks to hide, minimize, dismiss, go away, get the assistant/app/window out of "
+            "the way, or says they are done talking for now. This affects only the "
+            "assistant's own desktop window."
+        ),
+        parameters=object_schema({}),
+        handler=lambda _args: _window_action_result(controller.minimize_agent_window()),
+    )
+
+
 def _change_volume(controller: VolumeController, delta: Any) -> dict[str, Any]:
     current = controller.get_volume_percent()
     updated = controller.set_volume_percent(clamp_percent(current + _int_value(delta)))
@@ -178,6 +198,18 @@ def _brightness_result(levels: list[int]) -> dict[str, Any]:
         "display_brightness": levels,
         "display_count": len(levels),
     }
+
+
+def _window_action_result(result: WindowActionResult) -> dict[str, Any]:
+    output: dict[str, Any] = {
+        "ok": result.ok,
+        "process_id": result.process_id,
+        "window_title": result.window_title,
+        "hwnd": result.hwnd,
+    }
+    if result.reason is not None:
+        output["reason"] = result.reason
+    return output
 
 
 def _int_value(value: Any) -> int:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import shutil
 import sys
 import textwrap
@@ -19,6 +20,8 @@ YELLOW = "\x1b[33m"
 MAGENTA = "\x1b[35m"
 BLUE = "\x1b[34m"
 WHITE = "\x1b[37m"
+TUI_WIDTH_ENV = "WHISPERTOME_TUI_WIDTH"
+TUI_HEIGHT_ENV = "WHISPERTOME_TUI_HEIGHT"
 
 
 class NullVoiceUi:
@@ -231,12 +234,29 @@ class TerminalVoiceUi:
                 break
             with self._lock:
                 snapshot = self._state.copy()
-            width, height = shutil.get_terminal_size((100, 34))
+            width, height = terminal_size()
             frame = render_frame(snapshot, width=width, height=height, frame=self._frame)
             self._stream.write("\x1b[H\x1b[2J" + frame)
             self._stream.flush()
             self._frame += 1
             last_rendered = perf_counter()
+
+
+def terminal_size() -> tuple[int, int]:
+    fallback = shutil.get_terminal_size((88, 29))
+    width = _env_int(TUI_WIDTH_ENV, fallback.columns)
+    height = _env_int(TUI_HEIGHT_ENV, fallback.lines)
+    return width, height
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def render_frame(state: TerminalUiState, *, width: int, height: int, frame: int) -> str:
@@ -245,13 +265,18 @@ def render_frame(state: TerminalUiState, *, width: int, height: int, frame: int)
     if state.boot_active:
         return render_boot_frame(state, width=width, height=available_height, frame=frame)
 
-    content_width = min(width - 4, 112)
-    polygon_width = min(58, content_width)
+    compact = width <= 92 or available_height <= 30
+    content_width = min(width - 4, 96 if compact else 112)
+    polygon_width = min(48 if compact else 58, content_width)
     has_code = bool(state.code_text)
-    polygon_height = 11 if has_code else 15 if available_height >= 30 else 11
+    if has_code:
+        polygon_height = 7 if compact else 11
+    else:
+        polygon_height = 9 if compact else 15 if available_height >= 30 else 11
     title = f"{BOLD}{CYAN}WHISPER TO ME{RESET}"
     status = color_for_status(state.status_text) + state.status_text.upper() + RESET
     detail = f" {DIM}{state.status_detail}{RESET}" if state.status_detail else ""
+    text_body_lines = 2 if compact and has_code else 3
 
     lines: list[str] = []
     lines.append(center(title, width))
@@ -273,14 +298,16 @@ def render_frame(state: TerminalUiState, *, width: int, height: int, frame: int)
             "OUTPUT",
             state.assistant or "...",
             content_width,
+            body_lines=text_body_lines,
         )
     )
     lines.append("")
     if has_code:
-        code_height = 8 if available_height >= 34 else 6
+        code_height = 5 if compact else 8 if available_height >= 34 else 6
         lines.extend(render_code_box(state, content_width, code_height=code_height, frame=frame))
         lines.append("")
-    lines.extend(render_stream(state, content_width))
+    stream_budget = max(1, available_height - len(lines))
+    lines.extend(render_stream(state, content_width, max_height=stream_budget))
     return "\n".join(lines[:available_height]) + "\n"
 
 
@@ -501,21 +528,31 @@ def render_text_row(
     right_title: str,
     right_text: str,
     width: int,
+    *,
+    body_lines: int = 3,
 ) -> list[str]:
     gap = 4
     column_width = max(20, (width - gap) // 2)
-    left = render_box(left_title, left_text, column_width, color=GREEN)
-    right = render_box(right_title, right_text, column_width, color=MAGENTA)
+    left = render_box(left_title, left_text, column_width, color=GREEN, body_lines=body_lines)
+    right = render_box(right_title, right_text, column_width, color=MAGENTA, body_lines=body_lines)
     return [
         left_line + (" " * gap) + right_line
         for left_line, right_line in zip(left, right, strict=False)
     ]
 
 
-def render_box(title: str, text: str, width: int, *, color: str) -> list[str]:
+def render_box(
+    title: str,
+    text: str,
+    width: int,
+    *,
+    color: str,
+    body_lines: int = 3,
+) -> list[str]:
     inner = width - 4
-    wrapped = textwrap.wrap(text, width=inner, max_lines=3, placeholder="...") or [""]
-    wrapped = (wrapped + ["", ""])[:3]
+    body_lines = max(1, body_lines)
+    wrapped = textwrap.wrap(text, width=inner, max_lines=body_lines, placeholder="...") or [""]
+    wrapped = (wrapped + [""] * body_lines)[:body_lines]
     top = color + "+" + ("-" * (width - 2)) + "+" + RESET
     header = color + "| " + title.ljust(inner) + " |" + RESET
     body = [color + "| " + line.ljust(inner) + " |" + RESET for line in wrapped]
@@ -567,14 +604,25 @@ def wrap_code_lines(lines: list[str], width: int) -> list[str]:
     return wrapped
 
 
-def render_stream(state: TerminalUiState, width: int) -> list[str]:
-    lines = [f"{BOLD}{WHITE}SYSTEM STREAM{RESET}"]
+def render_stream(
+    state: TerminalUiState,
+    width: int,
+    *,
+    max_height: int | None = None,
+) -> list[str]:
+    if max_height is not None and max_height <= 0:
+        return []
+    header = f"{BOLD}{WHITE}SYSTEM STREAM{RESET}"
+    body_budget = None if max_height is None else max(0, max_height - 1)
+    wrapped_lines: list[str] = []
     for item in state.stream_lines:
         for wrapped in textwrap.wrap(item, width=max(20, width - 4)):
-            lines.append(f"{DIM}> {wrapped}{RESET}")
-    if len(lines) == 1:
-        lines.append(f"{DIM}> waiting for events{RESET}")
-    return lines
+            wrapped_lines.append(f"{DIM}> {wrapped}{RESET}")
+    if not wrapped_lines:
+        wrapped_lines.append(f"{DIM}> waiting for events{RESET}")
+    if body_budget is not None:
+        wrapped_lines = wrapped_lines[-body_budget:] if body_budget else []
+    return [header, *wrapped_lines]
 
 
 def center(text: str, width: int) -> str:

@@ -206,6 +206,7 @@ class OrganizationToolRegistryTests(unittest.TestCase):
             self.assertIn("screen_brightness_get", tool_names)
             self.assertIn("screen_brightness_set", tool_names)
             self.assertIn("screen_brightness_change", tool_names)
+            self.assertIn("agent_window_minimize", tool_names)
 
             note_event = registry.execute(
                 "notes_add",

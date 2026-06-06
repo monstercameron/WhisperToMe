@@ -499,3 +499,43 @@ Commit: `7e3e19f` (`Milestone: initial voice assistant scaffold`)
 
 - Keep the boot animation inside the existing terminal renderer instead of adding a separate splash subsystem.
 - Use ASCII-only rendering so the TUI remains stable in plain Windows terminal sessions.
+
+## Milestone 21: Desktop Terminal Host Prototype
+
+### Wins
+
+- Added a `desktop` command that opens an owned `WhisperToMe` Windows window.
+- The desktop host launches the existing `run --tui` voice loop as a child process, preserving the current audio, wake, OpenAI, TTS, and logging behavior.
+- Renders the child process ANSI terminal frames inside the window with a dark terminal surface and basic color support.
+- Closing the window or pressing Stop requests child shutdown from the host window.
+- Refined Stop and window close to request cooperative child shutdown through a per-run stop file before falling back to force termination.
+- Forced the desktop shell to an 800x600 target and passed a compact TUI viewport to the child process.
+- Reworked the TUI frame budget so the polygon, input/output panels, code viewport, and newest system-stream lines fit in the smaller window.
+- Coalesced queued ANSI frames in the desktop host so stale animation frames do not make the window feel behind.
+- Added an agent tool that hides the owned desktop host window to the system tray on direct user request.
+- Added a Windows tray icon with a right-click menu for show window, stop listening, and close program.
+- Added a wake-event signal file so the host restores, centers, and lifts the desktop window when wake detection fires.
+- Added a child-to-host window command signal so "minimize", "hide", and "we're done talking" can withdraw the Tk window instead of creating a taskbar-minimized window.
+- Tightened the system prompt and tool description so conversational dismissal phrases steer to the tray-hide tool.
+- Added tests for desktop argument parsing, host log resolution, and child command construction.
+
+### Losses
+
+- This first slice is an ANSI frame host, not a real ConPTY terminal emulator yet.
+- Keyboard input is intentionally not wired through because the current app is voice-first and does not need terminal input for normal use.
+- The host window is still a shell around the TUI rather than a native multi-panel Windows interface.
+- Cooperative stop is checked promptly while listening; a child stuck in a long external request can still require the fallback timeout.
+- The 800x600 shell requires tighter stream/code budgets, so older stream entries are intentionally dropped from view first.
+- The tray menu depends on `pystray` and `Pillow`; the desktop host logs and continues without a tray icon if those packages are unavailable.
+- If the tray icon cannot start, hiding the window would make recovery awkward, so logs should be checked before relying on tray-only operation on a new machine.
+
+### Decisions
+
+- Start with a no-new-dependency Tk host to validate first-class window ownership quickly.
+- Keep the embedded voice loop as a child process so crashes and logs stay isolated from the host window.
+- Prefer cooperative stop-file shutdown before any process-tree termination.
+- Favor a fixed small window while validating the app feel, then revisit resizable/native panels once the hosted loop is stable.
+- Pass host-window identity through environment variables so child-process tools can target the owned window precisely.
+- Use a small signal-file protocol for child-to-host window activation instead of parsing ANSI TUI frames.
+- Use a second signal-file command for tray-hide requests so the host process owns Tk `withdraw()` and restore behavior.
+- Leave WebView2/xterm.js or ConPTY as the next deeper integration step once the first window-host behavior is proven.
