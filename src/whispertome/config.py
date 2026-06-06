@@ -123,6 +123,7 @@ class STTConfig:
     backend: str
     model_path: Path
     language: str
+    max_tokens: int
 
 
 @dataclass(frozen=True)
@@ -205,9 +206,10 @@ def load_config(project_root: Path | None = None, *, require_openai_key: bool = 
             model_path=_env_path(
                 "WHISPERTOME_STT_MODEL_PATH",
                 root,
-                "models/whisper/whisper-tiny.onnx",
+                "models/whisper/whisper-tiny",
             ),
             language=_env("WHISPERTOME_STT_LANGUAGE", "en") or "en",
+            max_tokens=_env_int("WHISPERTOME_STT_MAX_TOKENS", 96),
         ),
         tts=TTSConfig(
             backend=_env("WHISPERTOME_TTS_BACKEND", "kokoro_onnx") or "kokoro_onnx",

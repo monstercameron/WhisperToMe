@@ -88,6 +88,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.20,
         help="Tone volume from 0.0 to 1.0.",
     )
+
+    test_stt_parser = subparsers.add_parser(
+        "test-stt",
+        help="Transcribe a WAV file or short microphone recording with the configured STT backend.",
+    )
+    stt_input = test_stt_parser.add_mutually_exclusive_group(required=True)
+    stt_input.add_argument("--wav", type=Path, help="WAV file to transcribe.")
+    stt_input.add_argument(
+        "--record-ms",
+        type=int,
+        help="Record microphone audio for this many milliseconds before transcribing.",
+    )
+    test_stt_parser.add_argument(
+        "--allow-non-npu",
+        action="store_true",
+        help="Debug only: allow non-NPU STT so transcription quality can be tested.",
+    )
     return parser
 
 
@@ -146,6 +163,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.command == "test-audio":
             return run_test_audio(args.duration_ms, args.frequency, args.volume)
+        if args.command == "test-stt":
+            config = load_config(args.project_root, require_openai_key=False)
+            return run_test_stt(
+                config,
+                wav_path=args.wav,
+                record_ms=args.record_ms,
+                allow_non_npu=args.allow_non_npu,
+            )
     except WhisperToMeError as exc:
         logging.getLogger(__name__).error("%s", exc)
         return 1
@@ -348,6 +373,84 @@ def run_test_audio(duration_ms: int, frequency: float, volume: float) -> int:
         volume,
     )
     return 0
+
+
+def run_test_stt(
+    config: AppConfig,
+    *,
+    wav_path: Path | None,
+    record_ms: int | None,
+    allow_non_npu: bool,
+) -> int:
+    logger = logging.getLogger(__name__)
+    from whispertome.models.registry import ModelRegistry
+    from whispertome.stt.whisper_onnx import WhisperOnnxDebugTranscriber
+
+    if wav_path is not None:
+        path = wav_path if wav_path.is_absolute() else config.project_root / wav_path
+        audio = load_audio_buffer_from_wav(path)
+    else:
+        assert record_ms is not None
+        audio = record_audio_buffer(config.audio.sample_rate, record_ms)
+
+    stt = ModelRegistry(config).create_stt()
+    try:
+        transcript = stt.transcribe(audio)
+    except WhisperToMeError as exc:
+        if not allow_non_npu:
+            raise
+        logger.warning(
+            "npu_stt_failed=%s debug_non_npu_stt_enabled=true",
+            exc,
+        )
+        transcript = WhisperOnnxDebugTranscriber(config.stt).transcribe(audio)
+
+    logger.info(
+        "stt_text=%r language=%s sample_rate=%d duration_ms=%d latency_ms=%.1f provider=%s",
+        transcript.text,
+        transcript.language,
+        audio.sample_rate,
+        audio.duration_ms,
+        transcript.latency_ms,
+        transcript.provider,
+    )
+    return 0
+
+
+def load_audio_buffer_from_wav(path: Path):
+    if not path.exists():
+        raise WhisperToMeError(f"WAV file does not exist: {path}")
+    try:
+        import soundfile as sf
+    except ImportError as exc:
+        raise WhisperToMeError("soundfile is required to read WAV files") from exc
+
+    from whispertome.audio.types import AudioBuffer
+
+    samples, sample_rate = sf.read(str(path), dtype="float32", always_2d=False)
+    return AudioBuffer(samples=samples, sample_rate=int(sample_rate))
+
+
+def record_audio_buffer(sample_rate: int, duration_ms: int):
+    if duration_ms <= 0:
+        raise WhisperToMeError("record-ms must be greater than 0")
+    try:
+        import sounddevice as sd
+    except ImportError as exc:
+        raise WhisperToMeError("sounddevice is required for microphone recording") from exc
+    import numpy as np
+
+    from whispertome.audio.types import AudioBuffer
+
+    frame_count = max(1, int(sample_rate * duration_ms / 1000))
+    recording = sd.rec(
+        frame_count,
+        samplerate=sample_rate,
+        channels=1,
+        dtype="float32",
+    )
+    sd.wait()
+    return AudioBuffer(samples=np.asarray(recording[:, 0], dtype=np.float32), sample_rate=sample_rate)
 
 
 if __name__ == "__main__":

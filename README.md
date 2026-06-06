@@ -186,6 +186,24 @@ Verify speaker playback separately from TTS:
 whispertome test-audio --duration-ms 500 --frequency 440 --volume 0.20
 ```
 
+Test STT model initialization and transcription:
+
+```powershell
+whispertome --project-root C:\Users\mreca\Desktop\whispertome test-stt --wav artifacts\tts-debug.wav
+whispertome --project-root C:\Users\mreca\Desktop\whispertome test-stt --record-ms 3000
+```
+
+Under the NPU-only policy these commands must fail if ONNX Runtime cannot place the entire Whisper graph on the selected NPU execution provider.
+
+For an audible/debug transcription smoke test while the NPU export is still blocked, use the explicit debug override:
+
+```powershell
+whispertome --project-root C:\Users\mreca\Desktop\whispertome test-stt --wav artifacts\tts-debug.wav --allow-non-npu
+whispertome --project-root C:\Users\mreca\Desktop\whispertome test-stt --record-ms 3000 --allow-non-npu
+```
+
+That command intentionally does not prove NPU execution; it exists only so microphone/file input, Whisper preprocessing, decoding, and tokenizer output can be tested.
+
 ## Current Build Status
 
 Implemented:
@@ -202,13 +220,15 @@ Implemented:
 - `test-wake` command for wake phrase routing tests without microphone/model access.
 - `test-tts` command for TTS initialization and WAV generation.
 - `test-audio` command for speaker playback checks without any model inference.
+- `test-stt` command for WAV-file and short microphone transcription checks.
+- Whisper ONNX split encoder/decoder adapter with Hugging Face feature extraction and tokenizer decoding.
 - Kokoro ONNX TTS adapter using the real `kokoro-onnx` tokenizer, phonemizer, voices, and injected NPU-only ONNX session.
 - Unit tests for config, wake phrase detection, and provider policy.
 
 Still required before the live assistant can complete an end-to-end spoken turn:
 
-- Choose the exact Whisper ONNX export format and wire its encoder/decoder/tokenizer adapter.
 - Produce or acquire a TTS export that QNN HTP can load with no CPU/GPU-assigned nodes.
+- Produce or acquire a Whisper export that QNN HTP can load with no CPU/GPU-assigned nodes.
 - Add provider-specific profiling to prove no local model runs on CPU or GPU.
 
 ### TTS Status
@@ -226,6 +246,17 @@ The next TTS artifact must be one of:
 - A Kokoro export compiled specifically for Windows ONNX Runtime QNN HTP with static graph shapes.
 - A QNN context ONNX generated from a context binary compatible with the target Snapdragon X NPU and this ONNX Runtime QNN build.
 - A different TTS architecture with fixed-shape subgraphs that QNN can claim completely.
+
+### STT Status
+
+The project is currently configured for `onnx-community/whisper-tiny` split ONNX artifacts:
+
+```text
+models/whisper/whisper-tiny/onnx/encoder_model_int8.onnx
+models/whisper/whisper-tiny/onnx/decoder_model_merged_int8.onnx
+```
+
+The adapter can run a debug transcription using `CPUExecutionProvider`, but ONNX Runtime QNN does not claim every node in the encoder or decoder graph. Because CPU fallback is disabled, strict NPU STT fails fast with a policy error.
 
 ## Research Notes
 
