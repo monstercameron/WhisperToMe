@@ -1,95 +1,88 @@
 # WhisperToMe
 
-WhisperToMe is a Windows voice assistant that lives on your desktop, listens for your chosen wake phrase, understands what you say with local Whisper STT, thinks through a hosted LLM, and speaks back with local TTS.
+A 24/7 local voice assistant for the desktop, optimized for the **Snapdragon X2 Elite**. Say
+`computer`, keep talking: it hears you with local Whisper, thinks with a hosted LLM, and speaks
+back with a local voice — with the whole speech stack running on the Hexagon NPU.
 
-It is built for the Snapdragon/NPU era: keep the speech stack local, keep the assistant quick, keep the UI alive, and make the whole thing feel more like a cockpit instrument than a chatbot tab.
+The design goal is an always-on assistant that stays efficient enough to run all day on a fanless
+ARM laptop: speech models on the NPU (not the CPU), short spoken replies, and a UI that shows what
+the system is doing.
 
-## The Pitch
+![WhisperToMe desktop window](docs/screenshot.png)
 
-Say `computer`, keep talking, and WhisperToMe handles the rest.
+## Core features
 
-- It listens continuously with a wake phrase instead of a button.
-- It transcribes locally through a modular Whisper backend.
-- It calls OpenAI Responses or Cerebras through a runtime-swappable LLM layer.
-- It streams text into speech so replies start sooner.
-- It keeps listening during playback so you can interrupt it naturally.
-- It stores notes, preferences, reminders, tasks, checklists, itinerary items, projects, decisions, and people notes in SQLite.
-- It can answer "what is up next?" from local time-sensitive organizer data.
-- It can adjust Windows volume, duck other apps, change brightness, minimize itself to the tray, run guarded PowerShell commands, and capture the desktop for visual context.
-- It can switch to other open windows ("switch to Chrome") and open web searches, maps, and sites in the browser.
-- It schedules future events and reminders that fire on their own — at a time or on a recurrence — to speak a reminder or run a recorded tool workflow autonomously.
-- It auto-compacts the conversation after an idle hour or when context fills up (a Codex-style, cache-aware threshold), keeping replies fast over long sessions.
-- It runs speech on the Snapdragon NPU: both Whisper STT and Supertonic TTS execute on the Hexagon NPU through ONNX Runtime QNN.
-- It ships with a desktop-hosted TUI: central animated polygon, voice-reactive waveform, a live "next up" agenda chip, input/output panes, status stream, code/script viewport, startup animation, tray menu, and wake-triggered restore.
+- **Always-listening wake loop** — continuous mic + VAD, sliding wake-phrase match, speech-pause
+  command capture. Interrupt playback by speaking the wake word.
+- **Speech on the NPU** — Whisper STT (Qualcomm AI Hub Whisper-Small) and Supertonic TTS both run
+  on the Hexagon NPU via ONNX Runtime QNN HTP, under a strict no-CPU/GPU-fallback policy.
+- **Swappable LLM** — OpenAI Responses or Cerebras, selectable at runtime; streaming text is fed to
+  sentence-level TTS so replies start sooner.
+- **Local memory** — SQLite organizer for notes, preferences, reminders, tasks, checklists,
+  itinerary, projects, decisions, and people; active preferences are injected into the prompt.
+- **Scheduled events** — reminders and recorded tool workflows that fire on their own at a time or
+  recurrence (one-shot or repeating), executed deterministically.
+- **Auto-compaction** — the conversation compacts after an idle hour or when context fills (a
+  Codex-style, cache-aware token threshold), keeping long sessions fast.
+- **Windows-native control** — volume, per-app ducking, brightness, desktop capture for vision,
+  switch-to-window, browser search/maps, and guarded PowerShell.
+- **Desktop UI** — an owned window + animated TUI: pipeline polygon, voice-reactive waveform, a
+  live "next up" agenda chip, transcript/assistant panes, system stream, code viewport, and a tray.
 
-## Why It Is Fun
+## On the NPU
 
-WhisperToMe is not trying to be another passive assistant bubble. It is a local-first voice rig for a power user desktop:
+Production local inference is NPU-only — if a graph can't be placed on the QNN HTP NPU, the app
+fails rather than quietly using CPU/GPU. Both halves of the speech stack meet that bar today.
+Supertonic was the harder half: its source ONNX is dynamic-shaped, so the adapter static-fixes the
+shapes and lets ONNX Runtime QNN compile a context binary on-device (cached after the first run),
+reaching roughly 10x realtime. Kokoro remains available as a CPU debug voice (`--allow-non-npu`).
 
-- The wake loop is always warm.
-- The UI shows what the system is doing right now.
-- The assistant can save useful structure instead of dropping everything into a chat transcript.
-- Preferences are injected compactly into the system prompt as they are saved.
-- Code blocks are rendered on screen instead of read aloud.
-- Background audio ducks when the assistant needs the stage.
-- The agent can look at the desktop when asked, then talk about what is actually on screen.
-
-## Current Shape
-
-The project is intentionally modular:
+## How it's built
 
 ```text
 src/whispertome/
-  agent/      local tool loop and system prompts
   audio/      microphone, playback, VAD, ducking
-  llm/        OpenAI and Cerebras provider adapters
-  models/     model registry and runtime wiring
+  stt/        Whisper adapters (Qualcomm QNN Whisper-Small on the NPU)
+  tts/        Supertonic (NPU) + Kokoro (CPU debug) adapters
+  llm/        OpenAI + Cerebras providers, conversation + compaction
+  agent/      local tool loop and tool registry
   organizer/  SQLite-backed memory and planning tools
+  scheduler/  in-process scheduled events that fire (reminders + workflows)
   runtime/    NPU-only provider selection + async runtime event bus
-  scheduler/  in-process scheduled events that fire (reminders + recorded workflows)
-  stt/        Whisper adapters (Qualcomm QNN Whisper-Small runs on the NPU)
-  tts/        Kokoro + Supertonic adapters (Supertonic runs on the NPU)
-  tui/        animated terminal UI
-  wake/       wake phrase detection and command routing
+  system/     Windows controls (volume, brightness, windows, PowerShell)
+  wake/       wake-phrase detection and command routing
+  ui/         animated terminal UI
+  desktop/    owned Windows host window + tray
+  pipeline.py / cli.py   the voice loop and commands
 ```
 
-The production policy is still strict: local AI inference runs on verified NPU paths, with no quiet CPU or GPU fallback. Both halves of the speech stack now meet it — Whisper STT and Supertonic TTS run on the Hexagon NPU via QNN HTP. Explicit debug flags can still bypass the policy (e.g. Kokoro on CPU) for voice-quality testing.
+Each layer has its own boundary, which is what made it possible to swap providers, STT/TTS
+backends, and UI surfaces without rewriting the loop.
 
-## Quick Start
+## The journey, briefly
 
-Developer setup, environment variables, model paths, live commands, desktop host details, and test commands now live in:
+It started as a CPU debug loop to get the product working, then moved STT onto the verified
+Qualcomm QNN Whisper-Small path for the X2 Elite. The long-running hard problem was NPU TTS — stock
+Kokoro is blocked by QNN's dynamic-shape limits — which was solved by bringing Supertonic onto the
+NPU via on-device context compilation. From there the work was autonomy and efficiency: scheduled
+events, idle/usage auto-compaction, a latency + energy pass, and Windows-native actions. The full
+milestone log lives in the [journey](research/journey.md).
 
-[Getting Started](docs/GETTING_STARTED.md)
+## Quick start
 
-The shortest current desktop dev run is now fully NPU (STT + Supertonic TTS), no debug flag:
+Native ARM64 Python 3.12 with the QNN runtime extra, then run the desktop app (fully NPU):
 
 ```powershell
+pip install -e .[qnn]
 whispertome --project-root C:\Users\mreca\Desktop\whispertome desktop --wake "computer"
 ```
 
-Add `--allow-non-npu` only to fall back to the Kokoro CPU debug voice.
+Add `--allow-non-npu` to fall back to the Kokoro CPU voice. Full setup, env vars, model paths, and
+all commands are in [Getting Started](docs/GETTING_STARTED.md).
 
-Use `--show-console` only when debugging the desktop host itself. Normal desktop mode should show the WhisperToMe window and tray icon without extra console windows.
+## More
 
-## Project Website
-
-A basic static project website lives in:
-
-[docs/index.html](docs/index.html)
-
-Open it directly in a browser. No build step is required.
-
-## Research
-
-Project history and research notes were moved out of the root so the README can stay readable:
-
-- [Journey](research/journey.md)
-- [Notes](research/notes.md)
-
-The TTS/NPU research thread resolved to a working NPU voice: **Supertonic** runs end-to-end on the Hexagon NPU (~10x realtime) by static-fixing the source ONNX and compiling fresh on-device. Kokoro stays as a CPU debug voice — its stock export is blocked on QNN dynamic shapes and a correct static export needs an attention-mask re-export (no ARM64 Windows PyTorch wheel). Details and the full milestone log are in the journey.
-
-## North Star
-
-Fast wake. Accurate dictation. Short spoken replies. Useful local memory. Desktop-native controls. Speech models on the NPU.
-
-That is the product.
+- [Getting Started](docs/GETTING_STARTED.md) — setup, environment, commands
+- [Project website](docs/index.html) — open directly in a browser, no build step
+- [Journey](research/journey.md) — milestone-by-milestone wins, losses, and decisions
+- [Notes](research/notes.md) — research scratch
