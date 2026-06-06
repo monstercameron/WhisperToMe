@@ -36,7 +36,10 @@ class FakeStt(SpeechToTextModel):
 class PlaybackWakeMonitorTests(unittest.TestCase):
     def test_monitor_sets_interrupt_event_when_wake_phrase_is_heard(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config = with_wake_phrases(load_config(Path(tmp), require_openai_key=False), ["computer"])
+            config = with_wake_phrases(
+                load_config(Path(tmp), require_openai_key=False),
+                ["computer"],
+            )
             config = replace(
                 config,
                 audio=replace(
@@ -58,12 +61,16 @@ class PlaybackWakeMonitorTests(unittest.TestCase):
                 ]
             )
             stt = FakeStt("Computer stop talking")
+            detected = []
+            speech_detected = []
             monitor = PlaybackWakeMonitor(
                 config=config,
                 chunks=chunks,
                 stt_model=stt,
                 min_speech_ms=0,
                 vad_threshold=0.01,
+                on_speech_detected=speech_detected.append,
+                on_wake_detected=detected.append,
             )
 
             monitor.start()
@@ -80,6 +87,10 @@ class PlaybackWakeMonitorTests(unittest.TestCase):
         self.assertEqual(monitor.result.event.kind, "command_ready")
         self.assertEqual(monitor.result.event.command, "stop talking")
         self.assertEqual(stt.calls, 1)
+        self.assertEqual(len(speech_detected), 1)
+        self.assertGreaterEqual(len(speech_detected[0]), 1)
+        self.assertEqual(len(detected), 1)
+        self.assertEqual(detected[0].transcript, "Computer stop talking")
 
 
 if __name__ == "__main__":

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Callable
+from typing import Any
 
 from whispertome.audio.types import AudioChunk
 from whispertome.audio.vad import EnergyVad, UtteranceSegmenter
@@ -14,8 +14,9 @@ from whispertome.stt.base import SpeechToTextModel
 from whispertome.wake.router import WakeCommandRouter, WakeRouterEvent
 from whispertome.wake.sliding_window import SlidingWakeDetector
 
-
 StatusCallback = Callable[[str, str], None]
+SpeechDetectedCallback = Callable[[tuple[AudioChunk, ...]], None]
+WakeDetectedCallback = Callable[["PlaybackInterruption"], None]
 
 
 @dataclass(frozen=True)
@@ -37,8 +38,11 @@ class PlaybackWakeMonitor:
         stt_model: SpeechToTextModel,
         min_speech_ms: int,
         vad_threshold: float,
+        stt_lock: Any | None = None,
         logger: logging.Logger | None = None,
         status_callback: StatusCallback | None = None,
+        on_speech_detected: SpeechDetectedCallback | None = None,
+        on_wake_detected: WakeDetectedCallback | None = None,
     ) -> None:
         self.interrupt_event = threading.Event()
         self._stop_event = threading.Event()
@@ -47,8 +51,11 @@ class PlaybackWakeMonitor:
         self._stt_model = stt_model
         self._min_speech_ms = min_speech_ms
         self._vad_threshold = vad_threshold
+        self._stt_lock = stt_lock
         self._logger = logger or logging.getLogger(__name__)
         self._status_callback = status_callback
+        self._on_speech_detected = on_speech_detected
+        self._on_wake_detected = on_wake_detected
         self._thread: threading.Thread | None = None
         self._result: PlaybackInterruption | None = None
         self._error: BaseException | None = None
@@ -84,7 +91,10 @@ class PlaybackWakeMonitor:
                 self._config.audio,
                 EnergyVad(self._vad_threshold),
             )
-            for utterance in segmenter.utterances(self._chunks_until_stopped()):
+            for utterance in segmenter.utterances(
+                self._chunks_until_stopped(),
+                on_speech_start=self._handle_speech_start,
+            ):
                 if self._stop_event.is_set():
                     break
                 active_ms = _active_ms(
@@ -97,7 +107,11 @@ class PlaybackWakeMonitor:
                     continue
                 self._emit_status("interruption stt", "checking wake")
                 started = perf_counter()
-                transcript = self._stt_model.transcribe(utterance)
+                if self._stt_lock is None:
+                    transcript = self._stt_model.transcribe(utterance)
+                else:
+                    with self._stt_lock:
+                        transcript = self._stt_model.transcribe(utterance)
                 wall_ms = (perf_counter() - started) * 1000.0
                 text = transcript.text.strip()
                 self._logger.info(
@@ -134,12 +148,34 @@ class PlaybackWakeMonitor:
                     event.match.phrase if event.match is not None else None,
                 )
                 self._emit_status("interruption detected", text)
+                if self._on_wake_detected is not None:
+                    try:
+                        self._on_wake_detected(self._result)
+                    except Exception:
+                        self._logger.exception("playback_wake_callback_failed")
                 self.interrupt_event.set()
                 self._stop_event.set()
                 break
         except BaseException as exc:  # pragma: no cover - defensive background boundary
             self._error = exc
             self._logger.exception("playback_wake_monitor_failed")
+
+    def _handle_speech_start(self, chunks: tuple[AudioChunk, ...]) -> None:
+        buffered_ms = sum(chunk.duration_ms for chunk in chunks)
+        start_ms = chunks[0].timestamp_ms if chunks else -1
+        self._logger.info(
+            "playback_user_speech_start chunks=%d start_ms=%d buffered_ms=%d",
+            len(chunks),
+            start_ms,
+            buffered_ms,
+        )
+        self._emit_status("interruption speech", "checking wake")
+        if self._on_speech_detected is None:
+            return
+        try:
+            self._on_speech_detected(chunks)
+        except Exception:
+            self._logger.exception("playback_speech_callback_failed")
 
     def _chunks_until_stopped(self) -> Iterator[AudioChunk]:
         while not self._stop_event.is_set():

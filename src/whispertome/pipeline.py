@@ -9,11 +9,11 @@ from whispertome.audio.vad import EnergyVad, UtteranceSegmenter
 from whispertome.config import AppConfig
 from whispertome.llm.openai_responses import OpenAIResponder
 from whispertome.models.registry import ModelRegistry
+from whispertome.organizer.tools import build_organization_tool_registry, build_organizer_store
 from whispertome.stt.base import SpeechToTextModel
 from whispertome.tts.base import TextToSpeechModel
 from whispertome.wake.router import WakeCommandRouter
 from whispertome.wake.sliding_window import SlidingWakeDetector
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -38,6 +38,7 @@ class VoiceLoop:
     def from_config(cls, config: AppConfig) -> VoiceLoop:
         registry = ModelRegistry(config)
         vad = EnergyVad(config.audio.vad_rms_threshold)
+        organizer_store = build_organizer_store(config.project_root)
         return cls(
             config=config,
             components=VoiceLoopComponents(
@@ -45,7 +46,14 @@ class VoiceLoop:
                 speaker=SpeakerOutput(),
                 stt=registry.create_stt(),
                 tts=registry.create_tts(),
-                responder=OpenAIResponder(config.openai),
+                responder=OpenAIResponder(
+                    config.openai,
+                    tool_registry=build_organization_tool_registry(
+                        config.project_root,
+                        store=organizer_store,
+                    ),
+                    system_context_provider=organizer_store.preference_prompt_context,
+                ),
                 wake_router=WakeCommandRouter(SlidingWakeDetector(config.wake)),
                 segmenter=UtteranceSegmenter(config.audio, vad),
             ),
@@ -96,4 +104,3 @@ class VoiceLoop:
             speech.provider,
         )
         self._components.speaker.play(speech.speech)
-

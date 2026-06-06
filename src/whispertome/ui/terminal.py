@@ -5,11 +5,10 @@ import shutil
 import sys
 import textwrap
 import threading
-import time
 from collections import deque
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import TextIO
-
 
 RESET = "\x1b[0m"
 DIM = "\x1b[2m"
@@ -113,14 +112,15 @@ class TerminalVoiceUi:
         self,
         *,
         stream: TextIO | None = None,
-        fps: float = 12.0,
+        fps: float = 24.0,
         max_lines: int = 10,
     ) -> None:
         self._stream = stream or sys.stdout
-        self._fps = max(2.0, fps)
+        self._fps = max(4.0, fps)
         self._state = TerminalUiState(max_lines=max_lines)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._render_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._frame = 0
 
@@ -128,6 +128,7 @@ class TerminalVoiceUi:
         if self._thread is not None:
             return
         self._stop_event.clear()
+        self._render_event.set()
         self._stream.write("\x1b[?25l")
         self._stream.flush()
         self._thread = threading.Thread(target=self._render_loop, daemon=True)
@@ -135,6 +136,7 @@ class TerminalVoiceUi:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._render_event.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
@@ -144,35 +146,51 @@ class TerminalVoiceUi:
     def status(self, text: str, detail: str = "") -> None:
         with self._lock:
             self._state.set_status(text, detail)
+        self._request_render()
 
     def line(self, text: str) -> None:
         with self._lock:
             self._state.add_line(text)
+        self._request_render()
 
     def user_text(self, text: str) -> None:
         with self._lock:
             self._state.set_user(text)
+        self._request_render()
 
     def assistant_text(self, text: str) -> None:
         with self._lock:
             self._state.set_assistant(text)
+        self._request_render()
 
     def code_block(self, language: str, code: str) -> None:
         with self._lock:
             self._state.set_code_block(language, code)
             self._state.add_line(f"rendered {language or 'code'} block")
+        self._request_render()
 
     def clear_code_block(self) -> None:
         with self._lock:
             self._state.clear_code_block()
+        self._request_render()
 
     def activity(self, value: float) -> None:
         with self._lock:
             self._state.set_activity(value)
+        self._request_render()
+
+    def _request_render(self) -> None:
+        self._render_event.set()
 
     def _render_loop(self) -> None:
         interval = 1.0 / self._fps
+        last_rendered = 0.0
         while not self._stop_event.is_set():
+            timeout = max(0.0, interval - (perf_counter() - last_rendered))
+            self._render_event.wait(timeout)
+            self._render_event.clear()
+            if self._stop_event.is_set():
+                break
             with self._lock:
                 snapshot = self._state.copy()
             width, height = shutil.get_terminal_size((100, 34))
@@ -180,7 +198,7 @@ class TerminalVoiceUi:
             self._stream.write("\x1b[H\x1b[2J" + frame)
             self._stream.flush()
             self._frame += 1
-            time.sleep(interval)
+            last_rendered = perf_counter()
 
 
 def render_frame(state: TerminalUiState, *, width: int, height: int, frame: int) -> str:
@@ -202,7 +220,7 @@ def render_frame(state: TerminalUiState, *, width: int, height: int, frame: int)
         polygon_width,
         polygon_height,
         frame=frame,
-        activity=state.activity_value,
+        activity=max(state.activity_value, status_activity_boost(state.status_text)),
         status=state.status_text,
     ):
         lines.append(center(polygon_line, width))
@@ -225,7 +243,14 @@ def render_frame(state: TerminalUiState, *, width: int, height: int, frame: int)
     return "\n".join(lines[:available_height]) + "\n"
 
 
-def render_polygon(width: int, height: int, *, frame: int, activity: float, status: str) -> list[str]:
+def render_polygon(
+    width: int,
+    height: int,
+    *,
+    frame: int,
+    activity: float,
+    status: str,
+) -> list[str]:
     width = max(22, width)
     height = max(9, height)
     grid = [[" " for _ in range(width)] for _ in range(height)]
@@ -310,7 +335,10 @@ def render_text_row(
     column_width = max(20, (width - gap) // 2)
     left = render_box(left_title, left_text, column_width, color=GREEN)
     right = render_box(right_title, right_text, column_width, color=MAGENTA)
-    return [left_line + (" " * gap) + right_line for left_line, right_line in zip(left, right, strict=False)]
+    return [
+        left_line + (" " * gap) + right_line
+        for left_line, right_line in zip(left, right, strict=False)
+    ]
 
 
 def render_box(title: str, text: str, width: int, *, color: str) -> list[str]:
@@ -341,7 +369,8 @@ def render_code_box(
     visible = wrapped_lines[offset : offset + viewport_height]
     title = f"{state.code_language.upper()} VIEW"
     if max_offset:
-        title = f"{title} {offset + 1}-{min(offset + viewport_height, len(wrapped_lines))}/{len(wrapped_lines)}"
+        end_line = min(offset + viewport_height, len(wrapped_lines))
+        title = f"{title} {offset + 1}-{end_line}/{len(wrapped_lines)}"
     top = YELLOW + "+" + ("-" * (width - 2)) + "+" + RESET
     header = YELLOW + "| " + title[:inner_width].ljust(inner_width) + " |" + RESET
     body = [
@@ -403,7 +432,12 @@ def color_for_status(status: str) -> str:
     lowered = status.lower()
     if "listen" in lowered:
         return BLUE
-    if "wake" in lowered or "detected" in lowered:
+    if (
+        "wake" in lowered
+        or "detected" in lowered
+        or "interrupted" in lowered
+        or "barge" in lowered
+    ):
         return GREEN
     if "openai" in lowered or "contact" in lowered:
         return YELLOW
@@ -414,6 +448,8 @@ def color_for_status(status: str) -> str:
 
 def status_marker(status: str) -> str:
     lowered = status.lower()
+    if "interrupted" in lowered or "barge" in lowered:
+        return "!"
     if "listen" in lowered:
         return "L"
     if "wake" in lowered or "detected" in lowered:
@@ -423,3 +459,14 @@ def status_marker(status: str) -> str:
     if "tts" in lowered or "play" in lowered or "speak" in lowered:
         return "T"
     return "*"
+
+
+def status_activity_boost(status: str) -> float:
+    lowered = status.lower()
+    if "interrupted" in lowered or "barge" in lowered:
+        return 1.0
+    if "wake" in lowered or "detected" in lowered:
+        return 0.9
+    if "transcribing" in lowered or "speech captured" in lowered:
+        return 0.55
+    return 0.0

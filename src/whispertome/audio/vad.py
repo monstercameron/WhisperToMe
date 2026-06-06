@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 import numpy as np
 
@@ -40,7 +40,14 @@ class UtteranceSegmenter:
         self._speech_end_chunks = max(1, config.speech_end_ms // config.block_ms)
         self._max_chunks = max(1, config.max_utterance_ms // config.block_ms)
 
-    def utterances(self, chunks: Iterable[AudioChunk]) -> Iterable[AudioBuffer]:
+    def utterances(
+        self,
+        chunks: Iterable[AudioChunk],
+        *,
+        on_speech_start: Callable[[tuple[AudioChunk, ...]], None] | None = None,
+        on_speech_chunk: Callable[[AudioChunk], None] | None = None,
+        on_speech_end: Callable[[], None] | None = None,
+    ) -> Iterable[AudioBuffer]:
         pre_roll: deque[AudioChunk] = deque(maxlen=self._pre_roll_chunks)
         active: list[AudioChunk] = []
         speech_run = 0
@@ -56,12 +63,18 @@ class UtteranceSegmenter:
                 if speech_run >= self._speech_start_chunks:
                     in_speech = True
                     active = list(pre_roll)
+                    if on_speech_start is not None:
+                        on_speech_start(tuple(active))
                     silence_run = 0
                 continue
 
             active.append(chunk)
+            if on_speech_chunk is not None:
+                on_speech_chunk(chunk)
             silence_run = silence_run + 1 if not decision.is_speech else 0
             if silence_run >= self._speech_end_chunks or len(active) >= self._max_chunks:
+                if on_speech_end is not None:
+                    on_speech_end()
                 yield self._merge(active)
                 active = []
                 pre_roll.clear()
@@ -76,4 +89,3 @@ class UtteranceSegmenter:
         sample_rate = chunks[0].sample_rate
         samples = np.concatenate([chunk.samples for chunk in chunks]).astype(np.float32, copy=False)
         return AudioBuffer(samples=samples, sample_rate=sample_rate)
-

@@ -12,6 +12,7 @@ dependencies = [
   "kokoro-onnx>=0.5.0",
   "numpy>=1.26",
   "openai>=2.0",
+  "pycaw>=20240210; platform_system == 'Windows'",
   "soundfile>=0.13",
   "sounddevice>=0.4.7",
   "transformers>=5.0",

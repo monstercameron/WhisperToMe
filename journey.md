@@ -321,3 +321,162 @@ Commit: `7e3e19f` (`Milestone: initial voice assistant scaffold`)
 - Stream only sentence-complete spoken chunks to avoid choppy TTS and mid-sentence prosody problems.
 - Keep `--no-stream-tts` as a practical fallback while tuning chunking, interruption, and audio device behavior.
 - Continue using the local TTS model for audio; OpenAI streaming is only for text deltas.
+
+## Milestone 13: Faster TUI Wake Sync
+
+### Wins
+
+- Changed the TUI renderer from a fixed polling loop to an event-driven loop that wakes immediately on state changes.
+- Increased the default TUI render rate from 12 FPS to 24 FPS for smoother polygon motion.
+- Added wake, interruption, and barge-in visual boosts so the central polygon reacts as soon as those states are set.
+
+### Losses
+
+- The TUI still depends on STT completion for true wake-word confirmation; this only removes render-loop lag after the wake state is known.
+
+### Decisions
+
+- Keep the animation event-driven instead of adding sleeps or polling in the wake loop.
+
+## Milestone 14: Interim Wake Preview During Speech
+
+### Wins
+
+- Added speech-start, speech-chunk, and speech-end callbacks to the VAD segmenter.
+- Added an interim wake preview worker that periodically transcribes a rolling audio window while the user is still speaking.
+- Updates the TUI to `wake detected` as soon as rolling STT sees the wake phrase, instead of waiting for the final speech pause.
+- Added a shared STT lock so interim preview, final STT, and playback interruption STT do not race the same model instance.
+- Scoped interim preview to TUI runs so non-visual console runs do not pay the extra STT cost.
+
+### Losses
+
+- This is not true streaming-token Whisper. The current QNN Whisper path remains batch inference over short rolling audio windows.
+- Interim preview can only accelerate the visual wake state; command execution still waits for the final pause-delimited transcript.
+
+### Decisions
+
+- Treat rolling interim transcripts as UI hints only. The final transcript remains the source of truth for router state and command dispatch.
+
+## Milestone 15: Agentic Organizer Loop
+
+### Wins
+
+- Added a local Responses function-tool loop around `OpenAIResponder`.
+- Tool calls are executed locally and returned to the model as `function_call_output` items.
+- Kept support for streamed final assistant text after tool calls, so streaming TTS still works for the live path.
+- Added a modular organizer store under ignored `artifacts/organizer/store.json`.
+- Implemented notes, checklist, and itinerary tools with local persistence.
+- Revised the system prompt so the assistant knows when to save notes, create/list/complete checklists, and add/list itinerary items.
+- Added TUI/log visibility for agent tool use through `wake_agent_tool`, `demo_agent_tool`, and `openai_agent_tool` log entries.
+- Added tests for organizer persistence and fake Responses tool loops.
+- Verified both non-streaming and streaming Responses API smoke tests with the real OpenAI endpoint and local `notes_add` execution.
+
+### Losses
+
+- Reminders are not real yet because they need a scheduler or notification surface.
+- Checklist completion by spoken text is heuristic when several items match.
+- Itinerary date parsing depends on the model converting natural language to fields; the local store does not parse dates itself.
+- `ruff` was not installed in the local virtual environment, so verification used pytest and compile checks.
+
+### Decisions
+
+- Keep organization data in ignored artifacts for local-first testing and no accidental commits.
+- Use function names with underscores, such as `notes_add`, for API compatibility.
+- Add only the core organizer tools now, then leave reminders, projects/goals, decision logs, contacts, and recurring routines as the next candidates.
+
+## Milestone 16: SQLite Organizer Expansion
+
+### Wins
+
+- Replaced the organizer JSON store with a SQLite database at `artifacts/organizer/organizer.sqlite`.
+- Added one-time migration from the legacy `artifacts/organizer/store.json` file.
+- Expanded the organizer from notes/checklists/itinerary to the first nine organization categories:
+  notes, reminders, checklists, itinerary, tasks, projects, daily plan, decision log, and people/contact notes.
+- Added add/list/complete-style tools where they make sense, while preserving the existing note/checklist/itinerary tool names.
+- Updated the system prompt so the model can choose the right organizer bucket for spoken requests.
+- Added tests for SQLite persistence, legacy JSON migration, and registry coverage across all nine categories.
+- Refined the prompt and `time_sensitive_check` tool for "up next", "next ups", and "important" queries with short lookahead windows and overdue open-loop inclusion.
+
+### Losses
+
+- Reminder alarms are still persistence-only; there is no background scheduler or notification loop yet.
+- Daily plan is a persisted plan plus a date query over tasks, reminders, and itinerary, not a full planner UI.
+- The tool list is larger now, which adds prompt/tool-schema payload to every OpenAI turn until we add deferred or intent-gated tool loading.
+
+### Decisions
+
+- Keep SQLite under ignored artifacts for local-first durability without committing personal organizer data.
+- Leave the legacy JSON file in place after migration rather than deleting user data automatically.
+- Prefer category-specific tool names for model reliability, even though a future latency pass may consolidate or defer rarely used tools.
+
+## Milestone 17: Preference Memory Injection
+
+### Wins
+
+- Added SQLite-backed preference storage for stable user defaults like preferred name, units, tone, and formatting.
+- Exposed `preferences_save` and `preferences_list` through the local Responses tool registry.
+- Active preferences are injected into the OpenAI system prompt on every request as a compact `User preferences` block.
+- Preference saves are visible immediately in the follow-up model call after the tool executes, without restarting the app.
+- Raw user wording can be stored as evidence, while only the compressed preference sentence is injected to control token cost.
+- Added tests for preference upsert/persistence, registry coverage, and dynamic prompt-context recomputation.
+
+### Losses
+
+- Preferences add two more tool schemas to the OpenAI request payload.
+- There is no explicit preference deletion/deactivation tool yet; changes currently rely on upserting the same stable key.
+
+### Decisions
+
+- Store prompt-ready preference sentences separately from raw evidence so runtime context stays small.
+- Sort injected preferences by priority and recency, then cap both item count and total characters.
+
+## Milestone 18: Windows System Controls And Wake Ducking
+
+### Wins
+
+- Added narrow agent tools for Windows master volume, mute state, and built-in screen brightness.
+- Added prompt guardrails so the model only changes volume or brightness on direct user request.
+- Added wake-time volume ducking during assistant playback interruption, with exact restore afterward.
+- Moved playback ducking earlier so it triggers on user-speech start, before batch STT confirms the wake phrase.
+- Reworked ducking to use per-application Windows audio sessions, lowering background apps like Chrome while excluding the assistant process.
+- Brightness read support was verified through the Windows WMI/CIM brightness classes on this machine.
+- Core Audio volume read support was verified after adding `pycaw` to the environment.
+- Added tests for system-control tools, percent clamping, relative changes, and volume duck/restore behavior.
+
+### Losses
+
+- External monitor brightness may not be controllable through the Windows WMI brightness classes.
+- The first `pycaw` integration assumed the older COM activation shape; the installed version exposes `EndpointVolume` directly, so the backend had to support both.
+- Wake ducking changes live Windows audio-session volumes, so the restore path has to stay conservative and robust.
+- Ducking after confirmed wake detection was too late for short assistant replies because confirmation waits on a pause-delimited STT segment.
+- Master-volume ducking and playback-only triggers did not match real testing with browser audio; the browser stayed normal because the app was in the normal wake-listening path, not playback interruption.
+
+### Decisions
+
+- Keep system controls narrow: no arbitrary desktop automation, no shell commands chosen by the model.
+- Duck volume only downward and restore the previous exact value after the interruption path.
+- Duck on user-speech start during assistant playback, then restore after playback if the speech was not a confirmed wake interruption.
+- Prefer per-app session ducking for live wake turns so the assistant voice stays audible while background audio drops.
+- Use built-in WMI/CIM for brightness before considering DDC/CI monitor-specific control.
+
+## Milestone 19: Per-App Wake Audio Ducking Verified
+
+### Wins
+
+- Replaced the live wake-loop ducker with Windows per-application audio-session ducking.
+- Confirmed `chrome.exe` could be lowered from full session volume to 25% and restored to full volume through `pycaw`.
+- Verified the live run ducks background sessions on interim wake detection before final pause-delimited STT completes.
+- Restores exact per-session volumes after the assistant turn finishes.
+- Kept the assistant process excluded so local TTS remains audible while browser/background audio drops.
+- Full test suite passed with 87 tests.
+
+### Losses
+
+- The original playback-only trigger missed the normal wake-listening path, so browser audio stayed loud when the user woke the assistant outside assistant playback.
+- Per-session ducking affects sessions that exist at duck time; a new audio session opened mid-turn may need another duck trigger.
+
+### Decisions
+
+- Use per-app audio-session ducking for automatic wake behavior.
+- Keep default speaker endpoint volume tools only for direct user requests like "turn the volume down."
+- Trigger ducking from interim wake detection, final wake detection, command turn start, and playback-interruption speech.

@@ -49,6 +49,8 @@ class ConfigTests(unittest.TestCase):
             old_stt_variant = os.environ.pop("WHISPERTOME_STT_ONNX_VARIANT", None)
             old_stt_prompt = os.environ.pop("WHISPERTOME_STT_PROMPT", None)
             old_speech_end = os.environ.pop("WHISPERTOME_SPEECH_END_MS", None)
+            old_duck_enabled = os.environ.pop("WHISPERTOME_WAKE_DUCK_VOLUME", None)
+            old_duck_percent = os.environ.pop("WHISPERTOME_WAKE_DUCK_VOLUME_PERCENT", None)
             try:
                 config = load_config(Path(tmp), require_openai_key=False)
             finally:
@@ -64,10 +66,33 @@ class ConfigTests(unittest.TestCase):
                     os.environ["WHISPERTOME_STT_PROMPT"] = old_stt_prompt
                 if old_speech_end is not None:
                     os.environ["WHISPERTOME_SPEECH_END_MS"] = old_speech_end
+                if old_duck_enabled is not None:
+                    os.environ["WHISPERTOME_WAKE_DUCK_VOLUME"] = old_duck_enabled
+                if old_duck_percent is not None:
+                    os.environ["WHISPERTOME_WAKE_DUCK_VOLUME_PERCENT"] = old_duck_percent
 
             self.assertEqual(config.openai.model, "gpt-5.5")
             self.assertEqual(config.openai.max_output_tokens, 512)
             self.assertIn("Use at most one fenced block", config.openai.system_prompt)
+            self.assertIn("Organization tools", config.openai.system_prompt)
+            self.assertIn("reminders", config.openai.system_prompt)
+            self.assertIn("daily plan", config.openai.system_prompt)
+            self.assertIn("time-sensitive check", config.openai.system_prompt)
+            self.assertIn("short but sweet", config.openai.system_prompt)
+            self.assertIn("plainspoken", config.openai.system_prompt)
+            self.assertIn("not literary", config.openai.system_prompt)
+            self.assertIn("ask one short follow-up question", config.openai.system_prompt)
+            self.assertIn("what's up next", config.openai.system_prompt)
+            self.assertIn("people/contact notes", config.openai.system_prompt)
+            self.assertIn("Use preferences", config.openai.system_prompt)
+            self.assertIn("call me X", config.openai.system_prompt)
+            self.assertIn("one compact prompt-ready sentence", config.openai.system_prompt)
+            self.assertIn("Keep stored resources clean", config.openai.system_prompt)
+            self.assertIn("mark stale", config.openai.system_prompt)
+            self.assertIn("no longer appear in active lists", config.openai.system_prompt)
+            self.assertIn("System control tools", config.openai.system_prompt)
+            self.assertIn("directly asks", config.openai.system_prompt)
+            self.assertIn("volume and brightness to 0-100", config.openai.system_prompt)
             self.assertEqual(config.stt.backend, "qai_whisper")
             self.assertEqual(config.stt.max_tokens, 64)
             self.assertEqual(config.stt.onnx_variant, "fp32")
@@ -85,6 +110,8 @@ class ConfigTests(unittest.TestCase):
             )
             self.assertEqual(config.audio.pre_roll_ms, 600)
             self.assertEqual(config.audio.speech_end_ms, 1200)
+            self.assertTrue(config.system.wake_duck_enabled)
+            self.assertEqual(config.system.wake_duck_percent, 25)
 
 
 if __name__ == "__main__":

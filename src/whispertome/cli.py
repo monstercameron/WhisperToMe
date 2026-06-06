@@ -6,6 +6,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from time import perf_counter
 from typing import Any
 
@@ -17,7 +18,6 @@ from whispertome.stt.base import SpeechToTextModel
 from whispertome.tts.base import SpeechSynthesisResult, TextToSpeechModel
 from whispertome.wake.router import WakeCommandRouter
 from whispertome.wake.sliding_window import SlidingWakeDetector
-
 
 _DEBUG_KOKORO_CACHE: dict[tuple[str, str], Any] = {}
 _DEBUG_STT_CACHE: dict[tuple[str, str, int, str, str], Any] = {}
@@ -646,11 +646,14 @@ def run_wake_loop(
     from whispertome.audio.playback import SpeakerOutput
     from whispertome.audio.vad import EnergyVad, UtteranceSegmenter
     from whispertome.llm.openai_responses import OpenAIResponder
+    from whispertome.organizer.tools import build_organization_tool_registry, build_organizer_store
+    from whispertome.system.windows import WindowsBackgroundAudioDucker
     from whispertome.text.markdown import parse_spoken_markdown
     from whispertome.text.streaming import SpokenTextChunker
     from whispertome.tts.streaming import StreamingSpeechPlayer, concatenate_speech
     from whispertome.ui.terminal import NullVoiceUi, TerminalVoiceUi
     from whispertome.wake.interruptions import PlaybackWakeMonitor
+    from whispertome.wake.live_preview import InterimWakePreview
 
     ui = TerminalVoiceUi(max_lines=tui_lines) if use_tui else NullVoiceUi()
     ui.start()
@@ -660,10 +663,66 @@ def run_wake_loop(
         allow_non_npu=allow_non_npu,
         prefer_debug_non_npu=allow_non_npu,
     )
-    responder = OpenAIResponder(config.openai)
+    organizer_store = build_organizer_store(config.project_root)
+    responder = OpenAIResponder(
+        config.openai,
+        tool_registry=build_organization_tool_registry(
+            config.project_root,
+            store=organizer_store,
+        ),
+        system_context_provider=organizer_store.preference_prompt_context,
+    )
     speaker = SpeakerOutput() if play else None
+    audio_ducker = WindowsBackgroundAudioDucker(
+        target_percent=config.system.wake_duck_percent,
+        enabled=config.system.wake_duck_enabled,
+        logger=logger,
+    )
+    logger.info(
+        "wake_audio_ducking enabled=%s target_percent=%d mode=session",
+        config.system.wake_duck_enabled,
+        config.system.wake_duck_percent,
+    )
     router = WakeCommandRouter(SlidingWakeDetector(config.wake))
     segmenter = UtteranceSegmenter(config.audio, EnergyVad(active_vad_threshold))
+    stt_lock = Lock()
+
+    def duck_background_audio(reason: str, *, turn_number: int | None = None) -> None:
+        result = audio_ducker.duck()
+        logger.info(
+            (
+                "wake_audio_duck_request turn=%s reason=%s ok=%s controlled=%d "
+                "lowered=%d target_percent=%s detail=%s"
+            ),
+            turn_number if turn_number is not None else "n/a",
+            reason,
+            result.ok,
+            result.controlled_count,
+            result.lowered_count,
+            result.target_percent,
+            result.reason,
+        )
+        if result.ok:
+            ui.status(
+                "ducking audio",
+                f"{result.lowered_count}/{result.controlled_count} apps",
+            )
+
+    def restore_background_audio(reason: str, *, turn_number: int | None = None) -> None:
+        result = audio_ducker.restore()
+        if result.ok or result.reason != "not_ducked":
+            logger.info(
+                (
+                    "wake_audio_restore_request turn=%s reason=%s ok=%s "
+                    "controlled=%d restored=%d detail=%s"
+                ),
+                turn_number if turn_number is not None else "n/a",
+                reason,
+                result.ok,
+                result.controlled_count,
+                result.restored_count,
+                result.reason,
+            )
 
     try:
         if warmup:
@@ -708,7 +767,33 @@ def run_wake_loop(
         utterance_count = 0
         command_count = 0
         chunks = MicrophoneInput(config.audio).chunks()
-        utterances = segmenter.utterances(chunks)
+        interim_preview = (
+            InterimWakePreview(
+                config=config,
+                stt_model=stt_model,
+                stt_lock=stt_lock,
+                logger=logger,
+                status_callback=ui.status,
+                line_callback=ui.line,
+                on_wake_detected=lambda _result: duck_background_audio(
+                    "interim_wake_detected"
+                ),
+            )
+            if use_tui
+            else None
+        )
+        utterances = segmenter.utterances(
+            chunks,
+            on_speech_start=(
+                interim_preview.start if interim_preview is not None else None
+            ),
+            on_speech_chunk=(
+                interim_preview.add_chunk if interim_preview is not None else None
+            ),
+            on_speech_end=(
+                interim_preview.finish if interim_preview is not None else None
+            ),
+        )
 
         def run_command_turn(
             command: str,
@@ -740,9 +825,36 @@ def run_wake_loop(
                 print(f"You: {command}")
             if command.lower() in {"q", "quit", "exit", "stop"}:
                 logger.info("wake_command_quit turn=%d", command_count)
+                restore_background_audio("quit_command", turn_number=command_count)
                 return CommandTurnResult(stop_requested=True)
+            duck_background_audio("command_turn_start", turn_number=command_count)
 
             queued_command: QueuedInterruptionCommand | None = None
+
+            def on_agent_tool_event(event) -> None:  # type: ignore[no-untyped-def]
+                logger.info(
+                    "wake_agent_tool turn=%d name=%s ok=%s latency_ms=%.1f args=%r output=%r",
+                    command_count,
+                    event.name,
+                    event.ok,
+                    event.latency_ms,
+                    event.arguments,
+                    event.output,
+                )
+                ui.status("using tool", event.name.replace("_", " "))
+                ui.line(f"tool {event.name}: {'ok' if event.ok else 'error'}")
+
+            def on_playback_speech_detected(_chunks: tuple[Any, ...]) -> None:
+                duck_background_audio(
+                    "playback_speech_start",
+                    turn_number=command_count,
+                )
+
+            def on_playback_wake_detected(_interruption: Any) -> None:
+                duck_background_audio(
+                    "playback_wake_confirmed",
+                    turn_number=command_count,
+                )
 
             if stream_tts:
                 ui.status("streaming openai", config.openai.model)
@@ -755,8 +867,11 @@ def run_wake_loop(
                         stt_model=stt_model,
                         min_speech_ms=min_speech_ms,
                         vad_threshold=active_vad_threshold,
+                        stt_lock=stt_lock,
                         logger=logger,
                         status_callback=ui.status,
+                        on_speech_detected=on_playback_speech_detected,
+                        on_wake_detected=on_playback_wake_detected,
                     )
                     interrupt_monitor.start()
                 player = StreamingSpeechPlayer(
@@ -790,6 +905,7 @@ def run_wake_loop(
                     llm_response = responder.generate_stream(
                         command,
                         on_delta=on_openai_delta,
+                        on_tool_event=on_agent_tool_event,
                     )
                     openai_wall_ms = (perf_counter() - openai_started) * 1000.0
                     for text_chunk in chunker.finish():
@@ -808,6 +924,10 @@ def run_wake_loop(
                 finally:
                     if interrupt_monitor is not None:
                         interrupt_monitor.stop()
+                    restore_background_audio(
+                        "stream_turn_finished",
+                        turn_number=command_count,
+                    )
 
                 spoken_response = parse_spoken_markdown(llm_response.text)
                 ui.assistant_text(spoken_response.display_text)
@@ -913,7 +1033,10 @@ def run_wake_loop(
             else:
                 ui.status("contacting openai", config.openai.model)
                 openai_started = perf_counter()
-                llm_response = responder.generate(command)
+                llm_response = responder.generate(
+                    command,
+                    on_tool_event=on_agent_tool_event,
+                )
                 openai_wall_ms = (perf_counter() - openai_started) * 1000.0
                 spoken_response = parse_spoken_markdown(llm_response.text)
                 ui.assistant_text(spoken_response.display_text)
@@ -971,7 +1094,10 @@ def run_wake_loop(
                 if speaker is not None:
                     ui.status(
                         "playing speech",
-                        f"{speech.speech.duration_ms} ms - say {config.wake.phrases[0]} to interrupt",
+                        (
+                            f"{speech.speech.duration_ms} ms - "
+                            f"say {config.wake.phrases[0]} to interrupt"
+                        ),
                     )
                     interrupt_monitor = PlaybackWakeMonitor(
                         config=config,
@@ -979,8 +1105,11 @@ def run_wake_loop(
                         stt_model=stt_model,
                         min_speech_ms=min_speech_ms,
                         vad_threshold=active_vad_threshold,
+                        stt_lock=stt_lock,
                         logger=logger,
                         status_callback=ui.status,
+                        on_speech_detected=on_playback_speech_detected,
+                        on_wake_detected=on_playback_wake_detected,
                     )
                     interrupt_monitor.start()
                     playback_started = perf_counter()
@@ -992,6 +1121,10 @@ def run_wake_loop(
                         playback_ms = (perf_counter() - playback_started) * 1000.0
                     finally:
                         interrupt_monitor.stop()
+                        restore_background_audio(
+                            "playback_finished",
+                            turn_number=command_count,
+                        )
                     interruption = interrupt_monitor.result
                     if playback_result.interrupted and interruption is not None:
                         logger.info(
@@ -1017,6 +1150,10 @@ def run_wake_loop(
                         )
                 else:
                     playback_ms = 0.0
+                    restore_background_audio(
+                        "no_play_turn_finished",
+                        turn_number=command_count,
+                    )
 
             if queued_command is not None:
                 logger.info(
@@ -1081,7 +1218,8 @@ def run_wake_loop(
 
             ui.status("transcribing", "QNN Whisper")
             stt_started = perf_counter()
-            transcript = stt_model.transcribe(utterance)
+            with stt_lock:
+                transcript = stt_model.transcribe(utterance)
             stt_wall_ms = (perf_counter() - stt_started) * 1000.0
             text = transcript.text.strip()
             ui.user_text(text)
@@ -1122,6 +1260,7 @@ def run_wake_loop(
                     event.match.transcript_window,
                 )
                 ui.status("wake detected", event.match.phrase)
+                duck_background_audio("wake_detected")
                 if not use_tui:
                     print("Wake detected. Listening for your command.")
                 continue
@@ -1178,6 +1317,7 @@ def run_wake_loop(
         close = getattr(locals().get("chunks", None), "close", None)
         if close is not None:
             close()
+        restore_background_audio("wake_loop_finished")
         ui.stop()
 
     logger.info(
@@ -1221,9 +1361,18 @@ def run_demo(
 
     from whispertome.audio.playback import SpeakerOutput
     from whispertome.llm.openai_responses import OpenAIResponder
+    from whispertome.organizer.tools import build_organization_tool_registry, build_organizer_store
     from whispertome.text.markdown import parse_spoken_markdown
 
-    responder = OpenAIResponder(config.openai)
+    organizer_store = build_organizer_store(config.project_root)
+    responder = OpenAIResponder(
+        config.openai,
+        tool_registry=build_organization_tool_registry(
+            config.project_root,
+            store=organizer_store,
+        ),
+        system_context_provider=organizer_store.preference_prompt_context,
+    )
     speaker = SpeakerOutput() if play else None
     stt_model = prepare_stt_model(
         config,
@@ -1402,8 +1551,22 @@ def run_demo(
                 logger.info("demo_transcript_quit turn=%d", turn)
                 break
 
+            def on_demo_tool_event(event: Any, *, turn_number: int = turn) -> None:
+                logger.info(
+                    "demo_agent_tool turn=%d name=%s ok=%s latency_ms=%.1f args=%r output=%r",
+                    turn_number,
+                    event.name,
+                    event.ok,
+                    event.latency_ms,
+                    event.arguments,
+                    event.output,
+                )
+
             openai_started = perf_counter()
-            llm_response = responder.generate(user_text)
+            llm_response = responder.generate(
+                user_text,
+                on_tool_event=on_demo_tool_event,
+            )
             openai_wall_ms = (perf_counter() - openai_started) * 1000.0
             spoken_response = parse_spoken_markdown(llm_response.text)
             logger.info(
@@ -1939,11 +2102,31 @@ def record_audio_buffer(sample_rate: int, duration_ms: int):
 def run_test_openai(config: AppConfig, text: str, *, reset: bool) -> int:
     logger = logging.getLogger(__name__)
     from whispertome.llm.openai_responses import OpenAIResponder
+    from whispertome.organizer.tools import build_organization_tool_registry, build_organizer_store
 
-    responder = OpenAIResponder(config.openai)
+    organizer_store = build_organizer_store(config.project_root)
+    responder = OpenAIResponder(
+        config.openai,
+        tool_registry=build_organization_tool_registry(
+            config.project_root,
+            store=organizer_store,
+        ),
+        system_context_provider=organizer_store.preference_prompt_context,
+    )
     if reset:
         responder.reset_conversation()
-    response = responder.generate(text)
+
+    def on_tool_event(event) -> None:  # type: ignore[no-untyped-def]
+        logger.info(
+            "openai_agent_tool name=%s ok=%s latency_ms=%.1f args=%r output=%r",
+            event.name,
+            event.ok,
+            event.latency_ms,
+            event.arguments,
+            event.output,
+        )
+
+    response = responder.generate(text, on_tool_event=on_tool_event)
     logger.info(
         "openai_response model=%s response_id=%s latency_ms=%.1f text=%r",
         response.model,

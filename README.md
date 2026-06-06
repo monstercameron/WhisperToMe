@@ -98,9 +98,11 @@ This repo is now structured as a Python package under `src/whispertome`.
 
 ```text
 src/whispertome/
+  agent/      Responses function-tool loop and tool registry
   audio/      microphone capture, playback, VAD, utterance segmentation
   llm/        OpenAI Responses API client
   models/     STT/TTS model registry
+  organizer/  local SQLite organizer tools
   runtime/    NPU-only ONNX Runtime provider selection
   stt/        Whisper STT adapter interface
   tts/        Kokoro TTS adapter interface
@@ -114,6 +116,8 @@ The code is intentionally modular:
 - Runtime selection is isolated from model code.
 - STT and TTS use abstract interfaces so new models can be added without changing the voice loop.
 - The OpenAI API client is isolated behind `OpenAIResponder`.
+- Agent tools are isolated behind a local registry so new tools can be added without changing the voice/audio loop.
+- Active SQLite preferences are injected into the OpenAI system prompt as compact context each turn.
 - Audio capture and playback are replaceable components.
 - Wake detection is text-window based, so it works with any STT backend.
 - A wake phrase can be supplied from `.env` or repeated `--wake` CLI flags.
@@ -172,13 +176,24 @@ For the live terminal UI, add `--tui`:
 whispertome --project-root C:\Users\mreca\Desktop\whispertome run --allow-non-npu --save-audio --wake "computer" --speech-end-ms 1200 --tui
 ```
 
-The TUI shows a central animated polygon whose pulse follows input activity, live input/output text panels, and a bounded 1-10 line system stream for states like `listening`, `wake detected`, `transcribing`, `contacting openai`, `running tts`, and `playing speech`. Use `--tui-lines 6` to change the stream height.
+The TUI shows a central animated polygon whose pulse follows input activity, live input/output text panels, and a bounded 1-10 line system stream for states like `listening`, `wake detected`, `transcribing`, `contacting openai`, `running tts`, and `playing speech`. UI state changes wake the renderer immediately so wake/interruption animations do not wait for the next fixed tick. Use `--tui-lines 6` to change the stream height.
+
+When the TUI is enabled, the wake loop also runs an interim wake preview during active speech. This is not true Whisper token streaming; the local Whisper/QNN path is still batch STT. Instead, the app periodically transcribes a rolling audio window while the user is still speaking and uses that interim transcript only to update the TUI wake state sooner. The final pause-delimited transcript remains the source of truth for command execution.
 
 The live wake loop streams OpenAI response deltas by default. Spoken-safe sentence chunks are sent to TTS as soon as they are complete, and audio chunks play in order while later tokens and TTS chunks are still being produced. Use `--no-stream-tts` to fall back to the older batch path for debugging.
 
 Markdown fenced code blocks in OpenAI responses are parsed before TTS. The voice does not read triple-backtick fences or code contents aloud; it says that the code/script is on screen. The system prompt asks for one fenced block per response by default, unless you explicitly ask for multiple files or examples. The TUI renders the latest fenced block, preferring ```script blocks, inside an auto-scrolling code viewport. The parser also catches obvious unfenced code, such as `package main`, as a defensive fallback so raw code is not read aloud.
 
 While assistant audio is playing, the wake loop keeps consuming the microphone stream in a background wake monitor. Say the wake phrase, for example `computer`, to interrupt playback. The monitor runs STT and wake matching concurrently with speaker output, stops audio when the wake phrase is detected, and logs `wake_playback_interrupted`. If the interruption transcript also contains a command, such as `computer I don't care`, the command is queued and immediately sent to OpenAI as the next turn.
+
+When wake activation starts, WhisperToMe ducks Windows audio sessions for other apps, such as the browser, while excluding the assistant process so TTS stays audible. Ducking can begin from interim wake detection, final wake detection, command turn start, or playback-interruption speech. Volumes are restored to their exact previous per-app levels when the turn finishes or the app exits. This is controlled by:
+
+```powershell
+WHISPERTOME_WAKE_DUCK_VOLUME=true
+WHISPERTOME_WAKE_DUCK_VOLUME_PERCENT=25
+```
+
+The duck target only lowers other app sessions; if an app is already below the target, it is not raised.
 
 The default end-of-speech silence is `WHISPERTOME_SPEECH_END_MS=1200`, which gives room for short thinking pauses, "um", and "ah" without cutting a sentence in half. For live tuning:
 
@@ -251,6 +266,45 @@ whispertome --project-root C:\Users\mreca\Desktop\whispertome test-openai "rite 
 
 The OpenAI layer uses the Responses API by default. It sends a dictation-aware system prompt every turn, wraps STT text as a speech transcript, and keeps `previous_response_id` when `OPENAI_STATEFUL=true`.
 
+The OpenAI layer also exposes a local function-tool loop for organization commands. When the model calls a tool, WhisperToMe executes it locally, sends a `function_call_output` item back to the Responses API, and continues until the assistant has a normal spoken response. The default SQLite-backed tools are:
+
+- Notes for loose memory, ideas, facts, and dictated snippets.
+- Preferences for stable personal defaults like what to call the user, preferred units, tone, formatting, and default assistant behavior.
+- Reminders for time-bound nudges and follow-ups.
+- Checklists for task lists, shopping lists, packing lists, and procedures.
+- Itinerary for dated or place-based plans, stops, appointments, and agendas.
+- Tasks for single actionable items with status, due date, priority, and project.
+- Projects for goal buckets that group tasks, notes, and decisions.
+- Daily plan for a date-focused view of tasks, reminders, and itinerary.
+- Time-sensitive check for "up next", "next ups", important items, due reminders,
+  due tasks, and itinerary in a short lookahead window.
+- Decision log for choices, rationale, dates, and project links.
+- People/contact notes for names, roles, preferences, and follow-ups.
+
+It also exposes narrow Windows system-control tools on direct user request:
+
+- `system_volume_get`, `system_volume_set`, `system_volume_change`, and `system_volume_mute`.
+- `screen_brightness_get`, `screen_brightness_set`, and `screen_brightness_change`.
+
+Volume uses Windows Core Audio through `pycaw`. Agent volume tools control the default speaker endpoint; wake ducking controls per-app audio sessions so browser/background audio can drop without lowering the assistant's own TTS. Built-in screen brightness uses Windows WMI/CIM classes; external monitor brightness may not be available unless Windows exposes it through those classes. The prompt tells the model to clamp values to 0-100, use small relative changes for vague commands, and confirm briefly.
+
+Organizer data is stored locally under ignored `artifacts\organizer\organizer.sqlite`. If an older `artifacts\organizer\store.json` exists, it is migrated into SQLite once and left in place as a legacy artifact. Preferences are upserted by stable keys such as `preferred_name` or `units`; only compact active preference sentences are injected into the system prompt, while raw user wording can be stored as evidence for debugging. The TUI system stream shows `using tool` while a tool is running, and logs include `wake_agent_tool`, `demo_agent_tool`, or `openai_agent_tool` entries with the tool name, arguments, result, and latency.
+
+Examples:
+
+```powershell
+whispertome --project-root C:\Users\mreca\Desktop\whispertome test-openai "take a note that the wake word is computer"
+whispertome --project-root C:\Users\mreca\Desktop\whispertome test-openai "make a checklist called demo prep with charge laptop and pack adapter"
+whispertome --project-root C:\Users\mreca\Desktop\whispertome test-openai "add prototype demo tomorrow at 10 AM in the lab to my itinerary"
+whispertome --project-root C:\Users\mreca\Desktop\whispertome test-openai "remind me tomorrow to review the demo notes"
+whispertome --project-root C:\Users\mreca\Desktop\whispertome test-openai "what is my daily plan for tomorrow"
+whispertome --project-root C:\Users\mreca\Desktop\whispertome test-openai "what time sensitive things do I have tomorrow"
+whispertome --project-root C:\Users\mreca\Desktop\whispertome test-openai "computer call me Marcus"
+whispertome --project-root C:\Users\mreca\Desktop\whispertome test-openai "computer I prefer metric values"
+```
+
+Next organization tools worth adding are recurring routines, calendar export/sync, notifications, templates, review mode, and specialized reading/packing/shopping lists. Reminders currently persist and appear in daily-plan queries; a true alarm needs a scheduler or notification layer.
+
 Run a full turn-based conversation demo:
 
 ```powershell
@@ -288,6 +342,10 @@ Implemented:
 - Speech-pause-delimited command capture after wake detection.
 - Token-window wake matching with fuzzy spans, stale-window protection, and original command-text extraction.
 - OpenAI Responses API client with a dictation-aware system prompt and stateful response chaining.
+- Responses API function-tool loop for local SQLite organizer tools.
+- SQLite-backed preference memory with compact real-time system prompt injection.
+- Windows volume and built-in screen brightness agent tools.
+- Per-app Windows audio-session ducking during wake turns and playback interruption.
 - Strict NPU-only ONNX Runtime provider selection.
 - `doctor` command for safe config and runtime checks.
 - `test-wake` command for wake phrase routing tests without microphone/model access.
@@ -345,6 +403,9 @@ The OpenAI layer is wired through the Responses API:
 - `instructions` carries the dictation-aware system prompt.
 - `input` is a user message containing the speech-to-text transcript.
 - `previous_response_id` is used for stateful turns when enabled.
+- `tools` exposes local organization functions when the agent registry is enabled.
+- `function_call_output` feeds local tool results back into the model until a final answer is ready.
+- Active saved preferences are appended to `instructions` as a compact `User preferences` block every request, including immediately after a preference-saving tool call.
 - `test-openai` verifies the API key, selected model, prompt, and response parsing.
 - The default model is `gpt-5.5`.
 - Spoken replies stay brief by prompt; `OPENAI_MAX_OUTPUT_TOKENS=512` leaves room for short fenced code blocks unless overridden.

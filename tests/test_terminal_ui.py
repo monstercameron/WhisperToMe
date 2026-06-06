@@ -8,6 +8,7 @@ from whispertome.ui.terminal import (
     render_code_box,
     render_frame,
     render_polygon,
+    status_activity_boost,
     status_marker,
     strip_ansi_len,
 )
@@ -67,6 +68,12 @@ class TerminalUiTests(unittest.TestCase):
 
         self.assertIn(status_marker("listening"), polygon)
         self.assertIn(RESET, polygon)
+
+    def test_wake_and_barge_in_statuses_get_visual_boost(self) -> None:
+        self.assertEqual(status_marker("wake detected"), "W")
+        self.assertEqual(status_marker("barge-in command"), "!")
+        self.assertGreaterEqual(status_activity_boost("wake detected"), 0.9)
+        self.assertEqual(status_activity_boost("barge-in command"), 1.0)
 
     def test_strip_ansi_len_ignores_color_sequences(self) -> None:
         self.assertEqual(strip_ansi_len("\x1b[31mhello\x1b[0m"), 5)
