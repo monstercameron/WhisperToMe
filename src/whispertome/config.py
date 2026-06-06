@@ -17,7 +17,7 @@ clarifying question when a transcript is ambiguous enough that acting would be r
 
 Respond for text-to-speech:
 - Keep answers brief, natural, and easy to say out loud.
-- Prefer one to three short sentences unless the user asks for detail.
+- Default to one short sentence. Use two or three only when needed for clarity.
 - Do not mention transcription errors unless they change the meaning.
 - Avoid markdown tables, code blocks, bullet-heavy formatting, URLs, and visual layout.
 - When the user is dictating text to be written, preserve their wording as much as possible
@@ -196,7 +196,7 @@ def load_config(project_root: Path | None = None, *, require_openai_key: bool = 
     if require_openai_key and not api_key:
         raise ConfigError("OPENAI_API_KEY is missing. Put it in .env or the process environment.")
 
-    max_output_tokens = _env_int("OPENAI_MAX_OUTPUT_TOKENS", 96)
+    max_output_tokens = _env_int("OPENAI_MAX_OUTPUT_TOKENS", 64)
     stt_onnx_variant = _env("WHISPERTOME_STT_ONNX_VARIANT", "fp32") or "fp32"
     if stt_onnx_variant not in {"fp32", "int8", "auto"}:
         raise ConfigError("WHISPERTOME_STT_ONNX_VARIANT must be fp32, int8, or auto")

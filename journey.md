@@ -175,3 +175,26 @@ Commit: `7e3e19f` (`Milestone: initial voice assistant scaffold`)
 - Treat Qualcomm AI Hub's precompiled QNN ONNX Whisper-Small artifact as the current production STT candidate.
 - Keep Moonshine parked until a native Windows ARM64 library is available or we choose to build it.
 - Continue enforcing no CPU/GPU fallback by selecting the NPU EP device and setting `session.disable_cpu_ep_fallback=1`.
+
+## Milestone 7: Local Latency Cleanup
+
+### Wins
+
+- Committed the QNN Whisper demo path as milestone `2cd2906`.
+- Found that demo STT wall time was much higher than model time because each turn rebuilt the STT object and reloaded Hugging Face tokenizer/config assets.
+- Changed the demo to prepare persistent STT and TTS model objects once before the turn loop.
+- Warmed the Qualcomm Whisper STT model once before the first turn instead of letting the first spoken turn pay setup cost.
+- Kept `qai_whisper` strict on the QNN/NPU path even when the demo uses `--allow-non-npu` for TTS.
+- Verified saved demo clips after the refactor: warmup was about 2518 ms once, then QNN STT wall time matched model time at 294-318 ms per short turn.
+- Added unit tests covering the STT debug-routing policy and TTS fallback activation.
+
+### Losses
+
+- OpenAI Responses API latency is still a hosted network/model round trip and is outside local NPU optimization.
+- TTS is still debug non-NPU Kokoro, so the full audible demo is not fully NPU-only yet.
+- Playback time is proportional to response length, so long assistant replies still make the conversation feel slower even if synthesis is fast.
+
+### Decisions
+
+- Keep the current local latency target focused on hot model reuse and short spoken replies.
+- Treat OpenAI streaming or Realtime/WebSocket as the next architectural step if time-to-first-audio becomes the main blocker.

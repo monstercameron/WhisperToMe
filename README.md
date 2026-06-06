@@ -233,7 +233,7 @@ Press Enter to start listening, then speak. The app records until a speech pause
 
 The `demo` command writes a log file automatically under `artifacts\logs\demo-*.log`. Use `--log-file artifacts\logs\my-demo.log` to choose a stable path. `--save-audio` writes each user recording and assistant TTS WAV under `artifacts\demo\...` so failed transcriptions and playback issues can be debugged later.
 
-The current full demo requires `--allow-non-npu` because the downloaded Whisper and Kokoro ONNX artifacts still fail strict QNN NPU placement. With that flag, the demo uses the explicit debug STT/TTS path so conversation testing stays responsive. Without that flag, the demo keeps the production policy strict and fails instead of silently using CPU or GPU execution.
+The current full audible demo requires `--allow-non-npu` because TTS is still on the explicit debug Kokoro path. STT stays on the verified Qualcomm QNN/NPU `qai_whisper` backend by default. The older `whisper_onnx` backend is the only STT path that opts into debug non-NPU mode with this flag. Without `--allow-non-npu`, the demo keeps the production policy strict and fails instead of silently using CPU or GPU execution.
 
 Performance-oriented demo options:
 
@@ -243,7 +243,7 @@ whispertome --project-root C:\Users\mreca\Desktop\whispertome demo --allow-non-n
 whispertome --project-root C:\Users\mreca\Desktop\whispertome demo --allow-non-npu --save-audio --fixed-record --record-ms 3000
 ```
 
-The default demo warms the debug STT/TTS models before the first turn, skips silent or very short captures, logs audio energy and clipping, and emits a `demo_turn_profile` line for each turn plus a `demo_profile_summary` at the end. If logs show `demo_audio_clipping`, lower the microphone input gain or move farther from the microphone; clipped speech will hurt Whisper accuracy.
+The default demo prepares and warms persistent STT/TTS objects before the first turn, skips silent or very short captures, logs audio energy and clipping, and emits a `demo_turn_profile` line for each turn plus a `demo_profile_summary` at the end. On the Qualcomm Whisper-Small QNN path, warmup is about 2.5 seconds once and saved short-turn transcriptions run in about 300 ms wall time. If logs show `demo_audio_clipping`, lower the microphone input gain or move farther from the microphone; clipped speech will hurt Whisper accuracy.
 
 For STT quality testing, the demo transcribes the raw speech-pause capture instead of the trimmed diagnostic clip. This keeps the front of short utterances intact while still avoiding the old fixed five-second recording delay. `turn-*-user.wav` and `turn-*-raw.wav` are both saved when `--save-audio` is enabled.
 
@@ -272,11 +272,10 @@ Implemented:
 - Kokoro ONNX TTS adapter using the real `kokoro-onnx` tokenizer, phonemizer, voices, and injected NPU-only ONNX session.
 - Unit tests for config, wake phrase detection, and provider policy.
 
-Still required before the live assistant can complete an end-to-end spoken turn:
+Still required before the live assistant can complete a fully NPU-only spoken turn:
 
 - Produce or acquire a TTS export that QNN HTP can load with no CPU/GPU-assigned nodes.
-- Produce or acquire a Whisper export that QNN HTP can load with no CPU/GPU-assigned nodes.
-- Add provider-specific profiling to prove no local model runs on CPU or GPU.
+- Add provider-specific profiling for TTS once a compatible artifact is available.
 
 ### TTS Status
 
@@ -296,16 +295,14 @@ The next TTS artifact must be one of:
 
 ### STT Status
 
-The project is currently configured for `onnx-community/whisper-base` split ONNX artifacts, with `onnx-community/whisper-small.en` downloaded for slower English-only comparison tests:
+The project is currently configured for Qualcomm AI Hub Whisper-Small precompiled QNN ONNX artifacts on this Snapdragon X2 Elite machine:
 
 ```text
-models/whisper/whisper-base/onnx/encoder_model_int8.onnx
-models/whisper/whisper-base/onnx/decoder_model_merged_int8.onnx
-models/whisper/whisper-small.en/onnx/encoder_model_int8.onnx
-models/whisper/whisper-small.en/onnx/decoder_model_merged_int8.onnx
+models/qai/whisper_small/snapdragon_x2_elite/precompiled_qnn_onnx/extracted/whisper_small-precompiled_qnn_onnx-float-qualcomm_snapdragon_x2_elite/encoder.onnx
+models/qai/whisper_small/snapdragon_x2_elite/precompiled_qnn_onnx/extracted/whisper_small-precompiled_qnn_onnx-float-qualcomm_snapdragon_x2_elite/decoder.onnx
 ```
 
-The adapter can run a debug transcription using `CPUExecutionProvider`, but ONNX Runtime QNN does not claim every node in the encoder or decoder graph. Because CPU fallback is disabled, strict NPU STT fails fast with a policy error. The debug decoder now derives cache shapes from the ONNX graph, supports English-only forced prompts, and trims obvious repeated-token loops.
+The `qai_whisper` adapter loads encoder and decoder sessions through the ONNX Runtime QNN plugin EP device with `session.disable_cpu_ep_fallback=1`. It transcribed the saved failed phrase `I need you to get sexy for me.` correctly and runs short saved turns in about 300 ms after warmup. The older `whisper_onnx` adapter remains available for model-quality experiments, but it is not the current production STT path.
 
 ### OpenAI Status
 
@@ -315,7 +312,7 @@ The OpenAI layer is wired through the Responses API:
 - `input` is a user message containing the speech-to-text transcript.
 - `previous_response_id` is used for stateful turns when enabled.
 - `test-openai` verifies the API key, selected model, prompt, and response parsing.
-- Spoken replies default to `OPENAI_MAX_OUTPUT_TOKENS=96` unless overridden.
+- Spoken replies default to `OPENAI_MAX_OUTPUT_TOKENS=64` unless overridden.
 
 Realtime/WebSocket is not the default path yet. It remains the right future option if we switch to lower-latency cloud speech-to-speech or realtime audio transcription, but the current architecture keeps local STT/TTS plus a text Responses API turn.
 

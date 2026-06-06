@@ -13,6 +13,8 @@ from whispertome.config import AppConfig, load_config, with_wake_phrases
 from whispertome.errors import WhisperToMeError
 from whispertome.runtime.onnx_session import NpuOnlyOnnxSessionFactory
 from whispertome.runtime.providers import ProviderResolver
+from whispertome.stt.base import SpeechToTextModel
+from whispertome.tts.base import SpeechSynthesisResult, TextToSpeechModel
 from whispertome.wake.router import WakeCommandRouter
 from whispertome.wake.sliding_window import SlidingWakeDetector
 
@@ -38,6 +40,92 @@ class RecordingResult:
     reason: str
     speech_start_ms: int | None
     speech_end_ms: int | None
+
+
+class FallbackTextToSpeechModel(TextToSpeechModel):
+    def __init__(
+        self,
+        primary: TextToSpeechModel,
+        fallback: TextToSpeechModel,
+        *,
+        logger: logging.Logger,
+    ) -> None:
+        self._primary = primary
+        self._fallback = fallback
+        self._logger = logger
+        self._active: TextToSpeechModel | None = None
+
+    def load(self) -> None:
+        if self._active is not None:
+            self._active.load()
+            return
+        try:
+            self._primary.load()
+            self._active = self._primary
+        except WhisperToMeError as exc:
+            self._activate_fallback(exc)
+
+    def synthesize(self, text: str) -> SpeechSynthesisResult:
+        model = self._active or self._primary
+        try:
+            result = model.synthesize(text)
+            if self._active is None:
+                self._active = model
+            return result
+        except WhisperToMeError as exc:
+            if model is self._fallback:
+                raise
+            self._activate_fallback(exc)
+            return self._fallback.synthesize(text)
+
+    def _activate_fallback(self, exc: WhisperToMeError) -> None:
+        self._logger.warning(
+            "npu_tts_failed=%s debug_non_npu_tts_enabled=true",
+            exc,
+        )
+        self._fallback.load()
+        self._active = self._fallback
+
+
+class DebugKokoroSynthesizer(TextToSpeechModel):
+    def __init__(self, config: AppConfig) -> None:
+        self._config = config
+        self._kokoro: Any | None = None
+        self._provider_names: str | None = None
+
+    def load(self) -> None:
+        if self._kokoro is not None:
+            return
+        self._kokoro = get_kokoro_debug_non_npu(self._config)
+        self._provider_names = ", ".join(self._kokoro.sess.get_providers())
+        logging.getLogger(__name__).warning(
+            "debug_non_npu_tts_provider=%s",
+            self._provider_names,
+        )
+
+    def synthesize(self, text: str) -> SpeechSynthesisResult:
+        from whispertome.audio.types import SynthesizedSpeech
+
+        self.load()
+        assert self._kokoro is not None
+        assert self._provider_names is not None
+
+        started = perf_counter()
+        try:
+            samples, sample_rate = self._kokoro.create(
+                text,
+                voice=self._config.tts.voice,
+                speed=self._config.tts.speed,
+                lang=self._config.tts.language,
+            )
+        except AssertionError as exc:
+            raise WhisperToMeError(str(exc)) from exc
+        return SpeechSynthesisResult(
+            speech=SynthesizedSpeech(samples=samples, sample_rate=sample_rate),
+            latency_ms=(perf_counter() - started) * 1000.0,
+            model=str(self._config.tts.model_path),
+            provider=f"debug-non-npu:{self._provider_names}",
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -427,10 +515,21 @@ def run_demo(
 
     responder = OpenAIResponder(config.openai)
     speaker = SpeakerOutput() if play else None
-    if allow_non_npu and warmup:
+    stt_model = prepare_stt_model(
+        config,
+        allow_non_npu=allow_non_npu,
+        prefer_debug_non_npu=should_prefer_debug_stt(config, allow_non_npu),
+    )
+    tts_model = prepare_tts_model(
+        config,
+        allow_non_npu=allow_non_npu,
+        prefer_debug_non_npu=allow_non_npu,
+    )
+    if warmup:
         warmup_started = perf_counter()
         logger.info("demo_warmup_started")
-        preload_debug_models(config)
+        stt_model.load()
+        tts_model.load()
         logger.info(
             "demo_warmup_complete latency_ms=%.1f",
             (perf_counter() - warmup_started) * 1000.0,
@@ -574,12 +673,7 @@ def run_demo(
                 continue
 
             stt_started = perf_counter()
-            transcript = transcribe_audio(
-                config,
-                stt_audio,
-                allow_non_npu=allow_non_npu,
-                prefer_debug_non_npu=should_prefer_debug_stt(config, allow_non_npu),
-            )
+            transcript = stt_model.transcribe(stt_audio)
             stt_wall_ms = (perf_counter() - stt_started) * 1000.0
             user_text = transcript.text.strip()
             logger.info(
@@ -617,12 +711,7 @@ def run_demo(
             print(f"Assistant: {llm_response.text}")
 
             tts_started = perf_counter()
-            speech = synthesize_text(
-                config,
-                llm_response.text,
-                allow_non_npu=allow_non_npu,
-                prefer_debug_non_npu=allow_non_npu,
-            )
+            speech = tts_model.synthesize(llm_response.text)
             tts_wall_ms = (perf_counter() - tts_started) * 1000.0
             logger.info(
                 "demo_tts turn=%d wall_ms=%.1f latency_ms=%.1f provider=%s sample_rate=%d",
@@ -691,10 +780,59 @@ def run_demo(
     return 0
 
 
+def prepare_stt_model(
+    config: AppConfig,
+    *,
+    allow_non_npu: bool,
+    prefer_debug_non_npu: bool | None = None,
+) -> SpeechToTextModel:
+    logger = logging.getLogger(__name__)
+    from whispertome.models.registry import ModelRegistry
+
+    prefer_debug = (
+        should_prefer_debug_stt(config, allow_non_npu)
+        if prefer_debug_non_npu is None
+        else prefer_debug_non_npu
+    )
+    if allow_non_npu and prefer_debug:
+        logger.warning("debug_non_npu_stt_direct=true")
+        return get_whisper_debug_non_npu(config)
+
+    return ModelRegistry(config).create_stt()
+
+
+def prepare_tts_model(
+    config: AppConfig,
+    *,
+    allow_non_npu: bool,
+    prefer_debug_non_npu: bool = False,
+) -> TextToSpeechModel:
+    logger = logging.getLogger(__name__)
+    from whispertome.models.registry import ModelRegistry
+
+    debug_tts = DebugKokoroSynthesizer(config)
+    if allow_non_npu and prefer_debug_non_npu:
+        logger.warning("debug_non_npu_tts_direct=true")
+        return debug_tts
+
+    tts = ModelRegistry(config).create_tts()
+    if not allow_non_npu:
+        return tts
+
+    return FallbackTextToSpeechModel(
+        primary=tts,
+        fallback=debug_tts,
+        logger=logger,
+    )
+
+
 def preload_debug_models(config: AppConfig) -> None:
-    if config.stt.backend == "whisper_onnx":
-        get_whisper_debug_non_npu(config).load()
-    get_kokoro_debug_non_npu(config)
+    prepare_stt_model(
+        config,
+        allow_non_npu=True,
+        prefer_debug_non_npu=should_prefer_debug_stt(config, allow_non_npu=True),
+    ).load()
+    prepare_tts_model(config, allow_non_npu=True, prefer_debug_non_npu=True).load()
 
 
 def should_prefer_debug_stt(config: AppConfig, allow_non_npu: bool) -> bool:
@@ -899,51 +1037,16 @@ def synthesize_text(
     allow_non_npu: bool,
     prefer_debug_non_npu: bool = False,
 ):
-    logger = logging.getLogger(__name__)
-    from whispertome.models.registry import ModelRegistry
-
-    if allow_non_npu and prefer_debug_non_npu:
-        logger.warning("debug_non_npu_tts_direct=true")
-        return synthesize_kokoro_debug_non_npu(config, text)
-
-    tts = ModelRegistry(config).create_tts()
-    try:
-        return tts.synthesize(text)
-    except WhisperToMeError as exc:
-        if not allow_non_npu:
-            raise
-        logger.warning(
-            "npu_tts_failed=%s debug_non_npu_tts_enabled=true",
-            exc,
-        )
-        return synthesize_kokoro_debug_non_npu(config, text)
+    tts = prepare_tts_model(
+        config,
+        allow_non_npu=allow_non_npu,
+        prefer_debug_non_npu=prefer_debug_non_npu,
+    )
+    return tts.synthesize(text)
 
 
 def synthesize_kokoro_debug_non_npu(config: AppConfig, text: str):
-    logger = logging.getLogger(__name__)
-    from whispertome.audio.types import SynthesizedSpeech
-    from whispertome.tts.base import SpeechSynthesisResult
-
-    kokoro = get_kokoro_debug_non_npu(config)
-    started = perf_counter()
-    try:
-        samples, sample_rate = kokoro.create(
-            text,
-            voice=config.tts.voice,
-            speed=config.tts.speed,
-            lang=config.tts.language,
-        )
-    except AssertionError as exc:
-        raise WhisperToMeError(str(exc)) from exc
-    latency_ms = (perf_counter() - started) * 1000.0
-    providers = ", ".join(kokoro.sess.get_providers())
-    logger.warning("debug_non_npu_tts_provider=%s", providers)
-    return SpeechSynthesisResult(
-        speech=SynthesizedSpeech(samples=samples, sample_rate=sample_rate),
-        latency_ms=latency_ms,
-        model=str(config.tts.model_path),
-        provider=f"debug-non-npu:{providers}",
-    )
+    return DebugKokoroSynthesizer(config).synthesize(text)
 
 
 def get_kokoro_debug_non_npu(config: AppConfig):
@@ -1040,26 +1143,14 @@ def transcribe_audio(
     audio,
     *,
     allow_non_npu: bool,
-    prefer_debug_non_npu: bool = False,
+    prefer_debug_non_npu: bool | None = None,
 ):
-    logger = logging.getLogger(__name__)
-    from whispertome.models.registry import ModelRegistry
-
-    if allow_non_npu and prefer_debug_non_npu:
-        logger.warning("debug_non_npu_stt_direct=true")
-        return transcribe_whisper_debug_non_npu(config, audio)
-
-    stt = ModelRegistry(config).create_stt()
-    try:
-        return stt.transcribe(audio)
-    except WhisperToMeError as exc:
-        if not allow_non_npu:
-            raise
-        logger.warning(
-            "npu_stt_failed=%s debug_non_npu_stt_enabled=true",
-            exc,
-        )
-        return transcribe_whisper_debug_non_npu(config, audio)
+    stt = prepare_stt_model(
+        config,
+        allow_non_npu=allow_non_npu,
+        prefer_debug_non_npu=prefer_debug_non_npu,
+    )
+    return stt.transcribe(audio)
 
 
 def transcribe_whisper_debug_non_npu(config: AppConfig, audio):

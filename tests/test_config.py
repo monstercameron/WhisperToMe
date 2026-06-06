@@ -59,7 +59,7 @@ class ConfigTests(unittest.TestCase):
                 if old_stt_prompt is not None:
                     os.environ["WHISPERTOME_STT_PROMPT"] = old_stt_prompt
 
-            self.assertEqual(config.openai.max_output_tokens, 96)
+            self.assertEqual(config.openai.max_output_tokens, 64)
             self.assertEqual(config.stt.backend, "qai_whisper")
             self.assertEqual(config.stt.max_tokens, 64)
             self.assertEqual(config.stt.onnx_variant, "fp32")
