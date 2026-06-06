@@ -125,6 +125,36 @@ def test_build_voice_loop_command_hosts_existing_tui() -> None:
     )
 
 
+def test_build_voice_loop_command_frozen_omits_module_flag(monkeypatch) -> None:
+    # In a PyInstaller one-file build, sys.executable IS the app, so "-m whispertome"
+    # is invalid; the child command must invoke the exe directly.
+    import whispertome.desktop.host as host
+
+    monkeypatch.setattr(host.sys, "frozen", True, raising=False)
+    command = build_voice_loop_command(
+        "C:/dist/whispertome.exe",
+        VoiceLoopLaunchOptions(
+            project_root=Path("C:/project"),
+            wake_phrases=("computer",),
+            max_commands=0,
+            allow_non_npu=False,
+            save_audio=False,
+            warmup=True,
+            min_speech_ms=250,
+            vad_threshold=None,
+            speech_end_ms=None,
+            play=True,
+            stream_tts=True,
+            tui_lines=10,
+            stop_file=None,
+            wake_event_file=None,
+        ),
+    )
+    assert command[0] == "C:/dist/whispertome.exe"
+    assert "-m" not in command
+    assert command[1:4] == ["--project-root", str(Path("C:/project")), "run"]
+
+
 def test_latest_terminal_frame_drops_stale_full_screen_frames() -> None:
     text = f"old log\n{FULL_FRAME_CLEAR}frame one\n{FULL_FRAME_CLEAR}frame two\n"
 

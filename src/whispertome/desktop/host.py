@@ -92,10 +92,12 @@ def build_voice_loop_command(
     python_executable: str,
     options: VoiceLoopLaunchOptions,
 ) -> list[str]:
-    command = [
-        python_executable,
-        "-m",
-        "whispertome",
+    command = [python_executable]
+    # A frozen one-file build IS the entry point, so `-m whispertome` is invalid there;
+    # only prepend the module flag when running under a real Python interpreter.
+    if not getattr(sys, "frozen", False):
+        command += ["-m", "whispertome"]
+    command += [
         "--project-root",
         str(options.project_root),
         "run",
