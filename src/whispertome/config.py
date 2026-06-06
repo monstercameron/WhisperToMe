@@ -82,6 +82,10 @@ System control tools:
   are done talking for now. Treat phrases like "we're done", "that's all",
   "I'm done talking", and "quiet for now" as requests to hide the app to the
   system tray, not the taskbar.
+- Use the desktop capture tool when the user asks what is on screen, asks for help
+  with what they are working on, or refers to "this", "that", "the page", "the
+  window", or visible desktop content that requires vision. The capture is attached
+  to the model as an image and excludes the WhisperToMe window by default.
 - Clamp requested volume and brightness to 0-100. For vague requests like "turn it
   down", "make it louder", "dim the screen", or "brighten it", use a small relative
   change around 10 percent.
@@ -281,7 +285,7 @@ def load_config(project_root: Path | None = None, *, require_openai_key: bool = 
         project_root=root,
         openai=OpenAIConfig(
             api_key=api_key,
-            model=_env("OPENAI_MODEL", "gpt-5.5") or "gpt-5.5",
+            model=_env("OPENAI_MODEL", "gpt-5.4-mini") or "gpt-5.4-mini",
             system_prompt=_env(
                 "OPENAI_SYSTEM_PROMPT",
                 DEFAULT_OPENAI_SYSTEM_PROMPT,

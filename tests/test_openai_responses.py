@@ -3,7 +3,13 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from whispertome.agent.tools import AgentTool, AgentToolRegistry, object_schema, string_schema
+from whispertome.agent.tools import (
+    OPENAI_INPUT_IMAGES_KEY,
+    AgentTool,
+    AgentToolRegistry,
+    object_schema,
+    string_schema,
+)
 from whispertome.config import OpenAIConfig
 from whispertome.llm.openai_responses import OpenAIResponder
 
@@ -64,6 +70,27 @@ class ToolLoopResponses:
                 ],
             )
         return SimpleNamespace(id="resp_final", output_text="Saved that note.")
+
+
+class CaptureToolLoopResponses:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            return SimpleNamespace(
+                id="resp_tool",
+                output=[
+                    SimpleNamespace(
+                        type="function_call",
+                        name="desktop_capture",
+                        arguments="{}",
+                        call_id="call_capture",
+                    )
+                ],
+            )
+        return SimpleNamespace(id="resp_final", output_text="I can see your desktop.")
 
 
 class StreamingToolLoopResponses:
@@ -142,6 +169,30 @@ def tool_registry() -> AgentToolRegistry:
                     required=["content"],
                 ),
                 handler=lambda args: {"ok": True, "saved": args["content"]},
+            )
+        ]
+    )
+
+
+def capture_registry() -> AgentToolRegistry:
+    return AgentToolRegistry(
+        [
+            AgentTool(
+                name="desktop_capture",
+                description="Capture the desktop.",
+                parameters=object_schema({}),
+                handler=lambda _args: {
+                    "ok": True,
+                    "path": "C:/project/artifacts/captures/desktop.png",
+                    "width": 1280,
+                    "height": 720,
+                    OPENAI_INPUT_IMAGES_KEY: [
+                        {
+                            "image_url": "data:image/png;base64,abc",
+                            "detail": "low",
+                        }
+                    ],
+                },
             )
         ]
     )
@@ -315,6 +366,37 @@ class OpenAIResponderTests(unittest.TestCase):
         self.assertEqual(responses.calls[1]["input"][0]["call_id"], "call_1")
         self.assertEqual(events[0].name, "notes_add")
         self.assertTrue(events[0].ok)
+
+    def test_agent_tool_loop_attaches_tool_images_to_model_input(self) -> None:
+        responses = CaptureToolLoopResponses()
+        config = OpenAIConfig(
+            api_key="test",
+            model="gpt-test",
+            system_prompt="System prompt",
+            max_output_tokens=None,
+            stateful=True,
+        )
+        events = []
+
+        response = OpenAIResponder(
+            config,
+            client=ToolLoopClient(responses),
+            tool_registry=capture_registry(),
+        ).generate("what am I working on", on_tool_event=events.append)
+
+        self.assertEqual(response.text, "I can see your desktop.")
+        followup_input = responses.calls[1]["input"]
+        self.assertEqual(followup_input[0]["type"], "function_call_output")
+        self.assertIn("image_attached_to_model", followup_input[0]["output"])
+        self.assertNotIn(OPENAI_INPUT_IMAGES_KEY, events[0].output)
+        self.assertTrue(events[0].output["image_attached_to_model"])
+        image_message = followup_input[1]
+        self.assertEqual(image_message["role"], "user")
+        self.assertEqual(image_message["content"][1]["type"], "input_image")
+        self.assertEqual(
+            image_message["content"][1]["image_url"],
+            "data:image/png;base64,abc",
+        )
 
     def test_tool_followup_recomputes_system_context_after_tool_execution(self) -> None:
         responses = PreferenceToolLoopResponses()

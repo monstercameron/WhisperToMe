@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from whispertome.agent.tools import (
+    OPENAI_INPUT_IMAGES_KEY,
     AgentTool,
     boolean_schema,
     integer_schema,
@@ -11,10 +13,13 @@ from whispertome.agent.tools import (
 from whispertome.system.windows import (
     AgentWindowController,
     BrightnessController,
+    DesktopCaptureController,
+    DesktopCaptureResult,
     VolumeController,
     WindowActionResult,
     WindowsAgentWindowController,
     WindowsBrightnessController,
+    WindowsDesktopCaptureController,
     WindowsVolumeController,
     clamp_percent,
 )
@@ -22,13 +27,16 @@ from whispertome.system.windows import (
 
 def build_system_control_tools(
     *,
+    project_root: Path | None = None,
     volume_controller: VolumeController | None = None,
     brightness_controller: BrightnessController | None = None,
     window_controller: AgentWindowController | None = None,
+    capture_controller: DesktopCaptureController | None = None,
 ) -> list[AgentTool]:
     volume = volume_controller or WindowsVolumeController()
     brightness = brightness_controller or WindowsBrightnessController()
     window = window_controller or WindowsAgentWindowController()
+    capture = capture_controller or WindowsDesktopCaptureController(project_root=project_root)
     return [
         _system_volume_get(volume),
         _system_volume_set(volume),
@@ -38,6 +46,7 @@ def build_system_control_tools(
         _screen_brightness_set(brightness),
         _screen_brightness_change(brightness),
         _agent_window_minimize(window),
+        _desktop_capture(capture),
     ]
 
 
@@ -175,6 +184,35 @@ def _agent_window_minimize(controller: AgentWindowController) -> AgentTool:
     )
 
 
+def _desktop_capture(controller: DesktopCaptureController) -> AgentTool:
+    return AgentTool(
+        name="desktop_capture",
+        description=(
+            "Capture the current Windows desktop and attach it as an image for visual "
+            "model context when the user asks what is on screen, asks for help with "
+            "what they are working on, or refers to something visible on the desktop. "
+            "By default, temporarily excludes the WhisperToMe window from the capture."
+        ),
+        parameters=object_schema(
+            {
+                "include_agent_window": boolean_schema(
+                    "True only if the user explicitly wants the WhisperToMe window included."
+                ),
+                "max_width": integer_schema(
+                    "Maximum preview image width sent to the model, from 512 to 1920.",
+                    minimum=512,
+                ),
+            },
+        ),
+        handler=lambda args: _desktop_capture_result(
+            controller.capture_desktop(
+                include_agent_window=bool(args.get("include_agent_window", False)),
+                max_width=_positive_int(args.get("max_width"), default=1280),
+            )
+        ),
+    )
+
+
 def _change_volume(controller: VolumeController, delta: Any) -> dict[str, Any]:
     current = controller.get_volume_percent()
     updated = controller.set_volume_percent(clamp_percent(current + _int_value(delta)))
@@ -212,8 +250,39 @@ def _window_action_result(result: WindowActionResult) -> dict[str, Any]:
     return output
 
 
+def _desktop_capture_result(result: DesktopCaptureResult) -> dict[str, Any]:
+    output: dict[str, Any] = {
+        "ok": result.ok,
+        "path": result.path,
+        "width": result.width,
+        "height": result.height,
+        "preview_width": result.preview_width,
+        "preview_height": result.preview_height,
+        "excluded_agent_window": result.excluded_agent_window,
+    }
+    if result.reason is not None:
+        output["reason"] = result.reason
+    if result.image_url:
+        output[OPENAI_INPUT_IMAGES_KEY] = [
+            {
+                "image_url": result.image_url,
+                "detail": "low",
+                "label": "desktop capture",
+            }
+        ]
+    return output
+
+
 def _int_value(value: Any) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _positive_int(value: Any, *, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default

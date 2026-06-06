@@ -56,7 +56,7 @@ def build_organization_tool_registry(
             _people_note_add(active_store),
             _people_list(active_store),
             _organization_summary(active_store),
-            *build_system_control_tools(),
+            *build_system_control_tools(project_root=project_root),
         ]
     )
 

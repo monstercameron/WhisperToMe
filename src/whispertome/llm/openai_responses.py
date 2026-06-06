@@ -7,6 +7,7 @@ from time import perf_counter
 from typing import Any
 
 from whispertome.agent.tools import (
+    OPENAI_INPUT_IMAGES_KEY,
     AgentToolEvent,
     AgentToolRegistry,
     parse_tool_arguments,
@@ -341,15 +342,28 @@ class OpenAIResponder:
                 )
             else:
                 event = self._tool_registry.execute(call.name, arguments)
+            image_messages = _tool_image_messages(call.name, event.output)
+            public_output = _public_tool_output(event.output)
+            public_event = (
+                event
+                if public_output is event.output
+                else AgentToolEvent(
+                    name=event.name,
+                    arguments=event.arguments,
+                    output=public_output,
+                    latency_ms=event.latency_ms,
+                )
+            )
             if on_tool_event is not None:
-                on_tool_event(event)
+                on_tool_event(public_event)
             outputs.append(
                 {
                     "type": "function_call_output",
                     "call_id": call.call_id,
-                    "output": tool_output_json(event.output),
+                    "output": tool_output_json(public_output),
                 }
             )
+            outputs.extend(image_messages)
         return outputs
 
     def _build_llm_response(self, response: Any, started: float) -> LlmResponse:
@@ -432,6 +446,49 @@ def _function_call_from_item(item: Any | None) -> FunctionCall | None:
         arguments=str(getattr(item, "arguments", "")),
         call_id=str(call_id),
     )
+
+
+def _public_tool_output(output: dict[str, Any]) -> dict[str, Any]:
+    if OPENAI_INPUT_IMAGES_KEY not in output:
+        return output
+    public = dict(output)
+    public.pop(OPENAI_INPUT_IMAGES_KEY, None)
+    public["image_attached_to_model"] = True
+    return public
+
+
+def _tool_image_messages(tool_name: str, output: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_images = output.get(OPENAI_INPUT_IMAGES_KEY)
+    if not isinstance(raw_images, list) or not raw_images:
+        return []
+
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": (
+                f"The {tool_name} tool attached a desktop screenshot. "
+                "Use it as visual context for the user's request."
+            ),
+        }
+    ]
+    for image in raw_images:
+        if not isinstance(image, dict):
+            continue
+        image_url = image.get("image_url")
+        if not isinstance(image_url, str) or not image_url:
+            continue
+        item: dict[str, Any] = {
+            "type": "input_image",
+            "image_url": image_url,
+        }
+        detail = image.get("detail")
+        if isinstance(detail, str) and detail in {"low", "high", "auto"}:
+            item["detail"] = detail
+        content.append(item)
+
+    if len(content) == 1:
+        return []
+    return [{"role": "user", "content": content}]
 
 
 def _extract_output_text(response: Any) -> str:

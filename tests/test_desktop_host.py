@@ -6,8 +6,12 @@ from whispertome.cli import build_parser, resolve_log_file
 from whispertome.desktop.host import (
     FULL_FRAME_CLEAR,
     VoiceLoopLaunchOptions,
+    WindowPlacement,
+    _center_placement,
     _estimate_tui_viewport,
     _latest_terminal_frame,
+    _load_window_placement,
+    _save_window_placement,
     build_voice_loop_command,
 )
 
@@ -131,3 +135,50 @@ def test_latest_terminal_frame_keeps_incremental_output() -> None:
 
 def test_estimate_tui_viewport_targets_800_by_600_shell() -> None:
     assert _estimate_tui_viewport(800, 600, 10) == (87, 29)
+
+
+def test_center_placement_targets_screen_middle() -> None:
+    placement = _center_placement(
+        width=800,
+        height=600,
+        screen_width=1920,
+        screen_height=1080,
+    )
+
+    assert placement == WindowPlacement(x=560, y=240, width=800, height=600)
+
+
+def test_window_placement_roundtrips_and_clamps_to_screen(tmp_path) -> None:
+    state_file = tmp_path / "window-state.json"
+    _save_window_placement(
+        state_file,
+        WindowPlacement(x=2000, y=900, width=800, height=600, manual=True),
+    )
+
+    placement = _load_window_placement(
+        state_file,
+        expected_width=800,
+        expected_height=600,
+        screen_width=1920,
+        screen_height=1080,
+    )
+
+    assert placement == WindowPlacement(x=1120, y=480, width=800, height=600, manual=True)
+
+
+def test_window_placement_ignores_saved_size_mismatch(tmp_path) -> None:
+    state_file = tmp_path / "window-state.json"
+    _save_window_placement(
+        state_file,
+        WindowPlacement(x=100, y=100, width=1280, height=720, manual=True),
+    )
+
+    placement = _load_window_placement(
+        state_file,
+        expected_width=800,
+        expected_height=600,
+        screen_width=1920,
+        screen_height=1080,
+    )
+
+    assert placement is None

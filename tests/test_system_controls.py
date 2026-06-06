@@ -9,6 +9,7 @@ from whispertome.agent.tools import AgentToolRegistry
 from whispertome.system.tools import build_system_control_tools
 from whispertome.system.windows import (
     DESKTOP_WINDOW_COMMAND_FILE_ENV,
+    DesktopCaptureResult,
     SystemVolumeDucker,
     WindowActionResult,
     WindowsAgentWindowController,
@@ -65,6 +66,34 @@ class FakeWindowController:
         return self.result
 
 
+class FakeCaptureController:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def capture_desktop(
+        self,
+        *,
+        include_agent_window: bool = False,
+        max_width: int = 1280,
+    ) -> DesktopCaptureResult:
+        self.calls.append(
+            {
+                "include_agent_window": include_agent_window,
+                "max_width": max_width,
+            }
+        )
+        return DesktopCaptureResult(
+            ok=True,
+            path="C:/project/artifacts/captures/desktop.png",
+            width=1920,
+            height=1080,
+            preview_width=max_width,
+            preview_height=576,
+            image_url="data:image/png;base64,abc",
+            excluded_agent_window=not include_agent_window,
+        )
+
+
 class FakeAudioSession:
     def __init__(
         self,
@@ -102,11 +131,13 @@ class SystemControlToolTests(unittest.TestCase):
         volume = FakeVolumeController(volume=50)
         brightness = FakeBrightnessController(levels=[40, 60])
         window = FakeWindowController()
+        capture = FakeCaptureController()
         registry = AgentToolRegistry(
             build_system_control_tools(
                 volume_controller=volume,
                 brightness_controller=brightness,
                 window_controller=window,
+                capture_controller=capture,
             )
         )
 
@@ -139,6 +170,12 @@ class SystemControlToolTests(unittest.TestCase):
         self.assertTrue(minimize["ok"])
         self.assertEqual(minimize["window_title"], "WhisperToMe")
         self.assertEqual(window.calls, 1)
+        screenshot = registry.execute("desktop_capture", {"max_width": 1024}).output
+        self.assertTrue(screenshot["ok"])
+        self.assertEqual(screenshot["path"], "C:/project/artifacts/captures/desktop.png")
+        self.assertEqual(screenshot["preview_width"], 1024)
+        self.assertIn("_openai_input_images", screenshot)
+        self.assertEqual(capture.calls[0]["max_width"], 1024)
 
     def test_agent_window_minimize_reports_unavailable_window(self) -> None:
         window = FakeWindowController(

@@ -539,3 +539,38 @@ Commit: `7e3e19f` (`Milestone: initial voice assistant scaffold`)
 - Use a small signal-file protocol for child-to-host window activation instead of parsing ANSI TUI frames.
 - Use a second signal-file command for tray-hide requests so the host process owns Tk `withdraw()` and restore behavior.
 - Leave WebView2/xterm.js or ConPTY as the next deeper integration step once the first window-host behavior is proven.
+
+## Follow-up: Desktop Placement and Visual Context
+
+### Wins
+
+- Centered the desktop host on first launch instead of relying on Tk's default window placement.
+- Added persisted window placement so manual user moves survive tray hide/show and future launches.
+- Added clamping for saved placement so stale monitor layouts cannot restore the window fully off-screen.
+- Added a `desktop_capture` tool that saves a PNG artifact and sends a downscaled PNG to the Responses API as an `input_image`.
+- Desktop capture temporarily excludes the WhisperToMe window when possible so the model can inspect what is behind the assistant.
+
+### Losses
+
+- Capturing behind the assistant requires a brief hide/show of the host window when it is visible, so there can be a small visual blink on capture requests.
+- The screenshot is visual context only; it does not grant arbitrary desktop control or OCR outside what the model can infer from the image.
+
+### Decisions
+
+- Keep placement state local in `artifacts\desktop\window-state.json` rather than introducing global Windows settings.
+- Send screenshots as Responses API image inputs, not as text-only file paths, because the model needs actual pixels to reason about the desktop.
+
+## Follow-up: Lower-Latency OpenAI Model
+
+### Wins
+
+- Switched the default OpenAI Responses model from `gpt-5.5` to `gpt-5.4-mini` for lower voice-loop latency, after confirming `gpt-5.5-mini` is not available in the account.
+- Added an `.env` override so the currently running app picks the mini model without relying on code defaults.
+
+### Losses
+
+- The mini model may be less capable on visual or nuanced reasoning than the regular model, so screen-inspection quality should be watched in logs.
+
+### Decisions
+
+- Prefer lower latency for the spoken loop unless a task clearly needs the regular model.

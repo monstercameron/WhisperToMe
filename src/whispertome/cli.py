@@ -705,14 +705,19 @@ def run_desktop(config: AppConfig, args: argparse.Namespace) -> int:
         / "desktop"
         / f"window-{desktop_stamp}.command"
     )
+    window_state_file = config.project_root / "artifacts" / "desktop" / "window-state.json"
     stop_file.unlink(missing_ok=True)
     wake_event_file.unlink(missing_ok=True)
     window_command_file.unlink(missing_ok=True)
     logging.getLogger(__name__).info(
-        "desktop_signal_files stop_file=%s wake_event_file=%s window_command_file=%s",
+        (
+            "desktop_signal_files stop_file=%s wake_event_file=%s "
+            "window_command_file=%s window_state_file=%s"
+        ),
         stop_file,
         wake_event_file,
         window_command_file,
+        window_state_file,
     )
     options = VoiceLoopLaunchOptions(
         project_root=config.project_root,
@@ -742,6 +747,7 @@ def run_desktop(config: AppConfig, args: argparse.Namespace) -> int:
             stop_file=stop_file,
             wake_event_file=wake_event_file,
             window_command_file=window_command_file,
+            window_state_file=window_state_file,
         )
     ).run()
 

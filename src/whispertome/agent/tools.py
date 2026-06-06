@@ -8,6 +8,7 @@ from typing import Any
 
 JsonObject = dict[str, Any]
 ToolHandler = Callable[[JsonObject], JsonObject]
+OPENAI_INPUT_IMAGES_KEY = "_openai_input_images"
 
 
 @dataclass(frozen=True)

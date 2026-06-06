@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import codecs
+import json
 import logging
 import os
 import queue
@@ -30,6 +31,8 @@ DEFAULT_WINDOW_WIDTH = 800
 DEFAULT_WINDOW_HEIGHT = 600
 DEFAULT_FONT_SIZE = 10
 WAKE_SHOW_DEBOUNCE_S = 1.5
+GEOMETRY_TRACKING_DELAY_MS = 600
+GEOMETRY_PROGRAMMATIC_S = 0.6
 COLOR_CODES = {
     "30": "fg_black",
     "31": "fg_red",
@@ -71,8 +74,18 @@ class DesktopHostConfig:
     stop_file: Path | None = None
     wake_event_file: Path | None = None
     window_command_file: Path | None = None
+    window_state_file: Path | None = None
     graceful_shutdown_timeout_s: float = 5.0
     slow_render_log_ms: float = 50.0
+
+
+@dataclass(frozen=True)
+class WindowPlacement:
+    x: int
+    y: int
+    width: int
+    height: int
+    manual: bool = False
 
 
 def build_voice_loop_command(
@@ -137,6 +150,9 @@ class DesktopTerminalHost:
         self._last_wake_event_mtime_ns: int | None = None
         self._last_window_command_mtime_ns: int | None = None
         self._last_show_monotonic = 0.0
+        self._tracking_window_position = False
+        self._programmatic_geometry_until = 0.0
+        self._window_placement: WindowPlacement | None = None
 
     def run(self) -> int:
         try:
@@ -147,6 +163,7 @@ class DesktopTerminalHost:
 
         root = tk.Tk()
         self._root = root
+        root.withdraw()
         root.title(self._config.title)
         root.geometry(f"{self._config.width}x{self._config.height}")
         root.minsize(self._config.width, self._config.height)
@@ -208,6 +225,10 @@ class DesktopTerminalHost:
         terminal.configure(state=tk.DISABLED)
         self._terminal = terminal
         self._configure_terminal_tags(terminal)
+        self._restore_or_center_window(reason="startup")
+        root.bind("<Configure>", self._on_root_configure)
+        root.after(GEOMETRY_TRACKING_DELAY_MS, self._enable_position_tracking)
+        root.deiconify()
 
         self._tray_icon = DesktopTrayIcon(
             title=self._config.title,
@@ -225,6 +246,100 @@ class DesktopTerminalHost:
         root.after(120, self._poll_window_command)
         root.mainloop()
         return self._process.returncode if self._process is not None else 0
+
+    def _restore_or_center_window(self, *, reason: str) -> None:
+        root = self._root
+        if root is None:
+            return
+        screen_width, screen_height = self._screen_size()
+        saved = _load_window_placement(
+            self._config.window_state_file,
+            expected_width=self._config.width,
+            expected_height=self._config.height,
+            screen_width=screen_width,
+            screen_height=screen_height,
+        )
+        placement = saved or _center_placement(
+            width=self._config.width,
+            height=self._config.height,
+            screen_width=screen_width,
+            screen_height=screen_height,
+        )
+        self._apply_window_placement(placement, reason=reason)
+
+    def _enable_position_tracking(self) -> None:
+        self._tracking_window_position = True
+
+    def _on_root_configure(self, event: object) -> None:
+        root = self._root
+        if root is None or getattr(event, "widget", None) is not root:
+            return
+        if not self._tracking_window_position:
+            return
+        if perf_counter() < self._programmatic_geometry_until:
+            return
+        if not _root_window_visible(root):
+            return
+        placement = self._read_root_placement(manual=True)
+        if placement is None:
+            return
+        if placement == self._window_placement:
+            return
+        self._window_placement = placement
+        _save_window_placement(self._config.window_state_file, placement)
+        LOGGER.info(
+            "desktop_window_position_saved x=%d y=%d width=%d height=%d",
+            placement.x,
+            placement.y,
+            placement.width,
+            placement.height,
+        )
+
+    def _read_root_placement(self, *, manual: bool) -> WindowPlacement | None:
+        root = self._root
+        if root is None:
+            return None
+        try:
+            root.update_idletasks()  # type: ignore[attr-defined]
+            return WindowPlacement(
+                x=int(root.winfo_x()),  # type: ignore[attr-defined]
+                y=int(root.winfo_y()),  # type: ignore[attr-defined]
+                width=int(root.winfo_width()),  # type: ignore[attr-defined]
+                height=int(root.winfo_height()),  # type: ignore[attr-defined]
+                manual=manual,
+            )
+        except Exception:
+            return None
+
+    def _screen_size(self) -> tuple[int, int]:
+        root = self._root
+        if root is None:
+            return self._config.width, self._config.height
+        try:
+            root.update_idletasks()  # type: ignore[attr-defined]
+            return (
+                int(root.winfo_screenwidth()),  # type: ignore[attr-defined]
+                int(root.winfo_screenheight()),  # type: ignore[attr-defined]
+            )
+        except Exception:
+            return self._config.width, self._config.height
+
+    def _apply_window_placement(self, placement: WindowPlacement, *, reason: str) -> None:
+        root = self._root
+        if root is None:
+            return
+        self._programmatic_geometry_until = perf_counter() + GEOMETRY_PROGRAMMATIC_S
+        self._window_placement = placement
+        root.geometry(_format_geometry(placement))  # type: ignore[attr-defined]
+        LOGGER.info(
+            "desktop_window_position_applied reason=%s x=%d y=%d width=%d height=%d manual=%s",
+            reason,
+            placement.x,
+            placement.y,
+            placement.width,
+            placement.height,
+            placement.manual,
+        )
 
     def _start_process(self) -> None:
         creationflags = 0
@@ -542,7 +657,7 @@ class DesktopTerminalHost:
         self._last_show_monotonic = now
         root.deiconify()  # type: ignore[attr-defined]
         root.state("normal")  # type: ignore[attr-defined]
-        self._center_window()
+        self._restore_or_center_window(reason="show")
         root.lift()  # type: ignore[attr-defined]
         try:
             root.focus_force()  # type: ignore[attr-defined]
@@ -551,20 +666,6 @@ class DesktopTerminalHost:
         except Exception:
             return True
         return True
-
-    def _center_window(self) -> None:
-        root = self._root
-        if root is None:
-            return
-        try:
-            root.update_idletasks()  # type: ignore[attr-defined]
-            screen_width = int(root.winfo_screenwidth())  # type: ignore[attr-defined]
-            screen_height = int(root.winfo_screenheight())  # type: ignore[attr-defined]
-        except Exception:
-            return
-        x = max(0, (screen_width - self._config.width) // 2)
-        y = max(0, (screen_height - self._config.height) // 2)
-        root.geometry(f"{self._config.width}x{self._config.height}+{x}+{y}")  # type: ignore[attr-defined]
 
     def _stop_process_now(self) -> None:
         process = self._process
@@ -617,6 +718,101 @@ def _estimate_tui_viewport(
     columns = int((window_width - 80) / char_width)
     rows = int((window_height - 150) / line_height)
     return max(60, min(112, columns)), max(24, min(34, rows))
+
+
+def _format_geometry(placement: WindowPlacement) -> str:
+    return f"{placement.width}x{placement.height}+{placement.x}+{placement.y}"
+
+
+def _center_placement(
+    *,
+    width: int,
+    height: int,
+    screen_width: int,
+    screen_height: int,
+) -> WindowPlacement:
+    return WindowPlacement(
+        x=max(0, (screen_width - width) // 2),
+        y=max(0, (screen_height - height) // 2),
+        width=width,
+        height=height,
+        manual=False,
+    )
+
+
+def _load_window_placement(
+    path: Path | None,
+    *,
+    expected_width: int,
+    expected_height: int,
+    screen_width: int,
+    screen_height: int,
+) -> WindowPlacement | None:
+    if path is None:
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        placement = WindowPlacement(
+            x=int(raw["x"]),
+            y=int(raw["y"]),
+            width=int(raw["width"]),
+            height=int(raw["height"]),
+            manual=bool(raw.get("manual", True)),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if placement.width != expected_width or placement.height != expected_height:
+        return None
+    return _clamp_placement_to_screen(
+        placement,
+        screen_width=screen_width,
+        screen_height=screen_height,
+    )
+
+
+def _save_window_placement(path: Path | None, placement: WindowPlacement) -> None:
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "x": placement.x,
+                    "y": placement.y,
+                    "width": placement.width,
+                    "height": placement.height,
+                    "manual": placement.manual,
+                },
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        return
+
+
+def _clamp_placement_to_screen(
+    placement: WindowPlacement,
+    *,
+    screen_width: int,
+    screen_height: int,
+) -> WindowPlacement:
+    max_x = max(0, screen_width - placement.width)
+    max_y = max(0, screen_height - placement.height)
+    return WindowPlacement(
+        x=max(0, min(placement.x, max_x)),
+        y=max(0, min(placement.y, max_y)),
+        width=placement.width,
+        height=placement.height,
+        manual=placement.manual,
+    )
 
 
 def _root_window_visible(root: object) -> bool:

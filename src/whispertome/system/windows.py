@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import base64
+import io
 import logging
 import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from threading import Lock
+from time import sleep
 from typing import Any, Protocol
 
 from whispertome.errors import WhisperToMeError
@@ -41,6 +45,15 @@ class AgentWindowController(Protocol):
     def minimize_agent_window(self) -> WindowActionResult: ...
 
 
+class DesktopCaptureController(Protocol):
+    def capture_desktop(
+        self,
+        *,
+        include_agent_window: bool = False,
+        max_width: int = 1280,
+    ) -> DesktopCaptureResult: ...
+
+
 class AudioSessionVolume(Protocol):
     pid: int | None
     process_name: str
@@ -61,6 +74,19 @@ class WindowActionResult:
     process_id: int | None
     window_title: str | None
     hwnd: int | None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class DesktopCaptureResult:
+    ok: bool
+    path: str | None
+    width: int | None
+    height: int | None
+    preview_width: int | None
+    preview_height: int | None
+    image_url: str | None = None
+    excluded_agent_window: bool = False
     reason: str | None = None
 
 
@@ -281,6 +307,93 @@ class WindowsAgentWindowController:
             window_title=self._title,
             hwnd=None,
         )
+
+
+class WindowsDesktopCaptureController:
+    """Captures the visible Windows desktop for multimodal model context."""
+
+    def __init__(
+        self,
+        *,
+        project_root: Path | None = None,
+        target_pid: int | None = None,
+        title: str | None = None,
+    ) -> None:
+        self._project_root = project_root or Path.cwd()
+        self._target_pid = target_pid if target_pid is not None else _env_pid()
+        self._title = title or os.environ.get(
+            DESKTOP_WINDOW_TITLE_ENV,
+            DEFAULT_DESKTOP_WINDOW_TITLE,
+        )
+
+    def capture_desktop(
+        self,
+        *,
+        include_agent_window: bool = False,
+        max_width: int = 1280,
+    ) -> DesktopCaptureResult:
+        try:
+            from PIL import ImageGrab
+        except ImportError as exc:
+            return DesktopCaptureResult(
+                ok=False,
+                path=None,
+                width=None,
+                height=None,
+                preview_width=None,
+                preview_height=None,
+                reason=f"Pillow is required for desktop capture: {exc}",
+            )
+
+        hwnd: int | None = None
+        was_visible = False
+        if not include_agent_window and sys.platform == "win32":
+            hwnd, was_visible = _hide_agent_window_for_capture(
+                pid=self._target_pid,
+                title=self._title,
+            )
+
+        try:
+            image = ImageGrab.grab(all_screens=True)
+            output_path = self._capture_path()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            image.save(output_path, format="PNG")
+            preview = image.copy()
+            preview.thumbnail((_max_capture_width(max_width), _max_capture_width(max_width)))
+            buffer = io.BytesIO()
+            preview.save(buffer, format="PNG", optimize=True)
+            image_url = "data:image/png;base64," + base64.b64encode(
+                buffer.getvalue()
+            ).decode("ascii")
+            width, height = image.size
+            preview_width, preview_height = preview.size
+            return DesktopCaptureResult(
+                ok=True,
+                path=str(output_path),
+                width=width,
+                height=height,
+                preview_width=preview_width,
+                preview_height=preview_height,
+                image_url=image_url,
+                excluded_agent_window=bool(hwnd and was_visible),
+            )
+        except Exception as exc:
+            return DesktopCaptureResult(
+                ok=False,
+                path=None,
+                width=None,
+                height=None,
+                preview_width=None,
+                preview_height=None,
+                reason=str(exc),
+            )
+        finally:
+            if hwnd is not None and was_visible:
+                _restore_agent_window_after_capture(hwnd)
+
+    def _capture_path(self) -> Path:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        return self._project_root / "artifacts" / "captures" / f"desktop-{stamp}.png"
 
 
 @dataclass(frozen=True)
@@ -667,3 +780,45 @@ def _find_top_level_window(
             if match[2] == title:
                 return match
     return matches[0]
+
+
+def _max_capture_width(value: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 1280
+    return max(512, min(parsed, 1920))
+
+
+def _hide_agent_window_for_capture(
+    *,
+    pid: int | None,
+    title: str,
+) -> tuple[int | None, bool]:
+    window = _find_top_level_window(pid=pid, title=title)
+    if window is None:
+        return None, False
+    hwnd = window[0]
+    try:
+        import ctypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        was_visible = bool(user32.IsWindowVisible(hwnd))
+        if was_visible:
+            sw_hide = 0
+            user32.ShowWindow(hwnd, sw_hide)
+            sleep(0.15)
+        return hwnd, was_visible
+    except Exception:
+        return None, False
+
+
+def _restore_agent_window_after_capture(hwnd: int) -> None:
+    try:
+        import ctypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        sw_show = 5
+        user32.ShowWindow(hwnd, sw_show)
+    except Exception:
+        return

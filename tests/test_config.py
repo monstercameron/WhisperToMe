@@ -71,7 +71,7 @@ class ConfigTests(unittest.TestCase):
                 if old_duck_percent is not None:
                     os.environ["WHISPERTOME_WAKE_DUCK_VOLUME_PERCENT"] = old_duck_percent
 
-            self.assertEqual(config.openai.model, "gpt-5.5")
+            self.assertEqual(config.openai.model, "gpt-5.4-mini")
             self.assertEqual(config.openai.max_output_tokens, 512)
             self.assertIn("Use at most one fenced block", config.openai.system_prompt)
             self.assertIn("Organization tools", config.openai.system_prompt)
@@ -100,6 +100,8 @@ class ConfigTests(unittest.TestCase):
             )
             self.assertIn("we're done", config.openai.system_prompt)
             self.assertIn("system tray", config.openai.system_prompt)
+            self.assertIn("desktop capture tool", config.openai.system_prompt)
+            self.assertIn("attached", config.openai.system_prompt)
             self.assertEqual(config.stt.backend, "qai_whisper")
             self.assertEqual(config.stt.max_tokens, 64)
             self.assertEqual(config.stt.onnx_variant, "fp32")
