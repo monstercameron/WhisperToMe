@@ -5,6 +5,7 @@ import unittest
 from whispertome.ui.terminal import (
     RESET,
     TerminalUiState,
+    render_code_box,
     render_frame,
     render_polygon,
     status_marker,
@@ -41,6 +42,25 @@ class TerminalUiTests(unittest.TestCase):
         self.assertIn("computer summarize the last request", frame)
         self.assertIn("Working on it.", frame)
         self.assertIn("using tools", frame)
+
+    def test_render_frame_contains_code_block_view(self) -> None:
+        state = TerminalUiState(max_lines=3)
+        state.set_code_block("script", "line one\nline two")
+
+        frame = render_frame(state, width=100, height=40, frame=0)
+
+        self.assertIn("SCRIPT VIEW", frame)
+        self.assertIn("line one", frame)
+        self.assertIn("line two", frame)
+
+    def test_code_box_reports_autoscroll_position(self) -> None:
+        state = TerminalUiState(max_lines=3)
+        state.set_code_block("script", "\n".join(f"line {index}" for index in range(8)))
+
+        box = "\n".join(render_code_box(state, 60, code_height=5, frame=24))
+
+        self.assertIn("SCRIPT VIEW", box)
+        self.assertIn("/8", box)
 
     def test_polygon_uses_status_marker(self) -> None:
         polygon = "\n".join(render_polygon(32, 11, frame=0, activity=0.5, status="listening"))

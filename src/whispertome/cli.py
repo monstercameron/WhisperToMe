@@ -604,7 +604,9 @@ def run_wake_loop(
     from whispertome.audio.playback import SpeakerOutput
     from whispertome.audio.vad import EnergyVad, UtteranceSegmenter
     from whispertome.llm.openai_responses import OpenAIResponder
+    from whispertome.text.markdown import parse_spoken_markdown
     from whispertome.ui.terminal import NullVoiceUi, TerminalVoiceUi
+    from whispertome.wake.interruptions import PlaybackWakeMonitor
 
     ui = TerminalVoiceUi(max_lines=tui_lines) if use_tui else NullVoiceUi()
     ui.start()
@@ -763,12 +765,24 @@ def run_wake_loop(
             openai_started = perf_counter()
             llm_response = responder.generate(command)
             openai_wall_ms = (perf_counter() - openai_started) * 1000.0
-            ui.assistant_text(llm_response.text)
-            ui.line(f"openai: {llm_response.text}")
+            spoken_response = parse_spoken_markdown(llm_response.text)
+            ui.assistant_text(spoken_response.display_text)
+            code_block = spoken_response.primary_code_block
+            if code_block is not None:
+                ui.code_block(code_block.language, code_block.code)
+                logger.info(
+                    "wake_response_code_block turn=%d language=%s chars=%d",
+                    command_count,
+                    code_block.language,
+                    len(code_block.code),
+                )
+            else:
+                ui.clear_code_block()
+            ui.line(f"openai: {spoken_response.display_text}")
             logger.info(
                 (
                     "wake_openai turn=%d wall_ms=%.1f latency_ms=%.1f model=%s "
-                    "response_id=%s chars=%d text=%r"
+                    "response_id=%s chars=%d speech_chars=%d code_blocks=%d text=%r"
                 ),
                 command_count,
                 openai_wall_ms,
@@ -776,14 +790,16 @@ def run_wake_loop(
                 llm_response.model,
                 llm_response.response_id,
                 len(llm_response.text),
+                len(spoken_response.speech_text),
+                len(spoken_response.code_blocks),
                 llm_response.text,
             )
             if not use_tui:
-                print(f"Assistant: {llm_response.text}")
+                print(f"Assistant: {spoken_response.display_text}")
 
             ui.status("running tts", "Kokoro voice")
             tts_started = perf_counter()
-            speech = tts_model.synthesize(llm_response.text)
+            speech = tts_model.synthesize(spoken_response.speech_text)
             tts_wall_ms = (perf_counter() - tts_started) * 1000.0
             logger.info(
                 "wake_tts turn=%d wall_ms=%.1f latency_ms=%.1f provider=%s sample_rate=%d",
@@ -802,11 +818,51 @@ def run_wake_loop(
                     assistant_path,
                 )
             if speaker is not None:
-                ui.status("playing speech", f"{speech.speech.duration_ms} ms")
+                ui.status(
+                    "playing speech",
+                    f"{speech.speech.duration_ms} ms - say {config.wake.phrases[0]} to interrupt",
+                )
+                interrupt_monitor = PlaybackWakeMonitor(
+                    config=config,
+                    chunks=chunks,
+                    stt_model=stt_model,
+                    min_speech_ms=min_speech_ms,
+                    vad_threshold=active_vad_threshold,
+                    logger=logger,
+                    status_callback=ui.status,
+                )
+                interrupt_monitor.start()
                 playback_started = perf_counter()
-                speaker.play(speech.speech)
-                playback_ms = (perf_counter() - playback_started) * 1000.0
-                logger.info("wake_played turn=%d latency_ms=%.1f", command_count, playback_ms)
+                try:
+                    playback_result = speaker.play_interruptible(
+                        speech.speech,
+                        interrupt_event=interrupt_monitor.interrupt_event,
+                    )
+                    playback_ms = (perf_counter() - playback_started) * 1000.0
+                finally:
+                    interrupt_monitor.stop()
+                interruption = interrupt_monitor.result
+                if playback_result.interrupted and interruption is not None:
+                    logger.info(
+                        (
+                            "wake_playback_interrupted turn=%d latency_ms=%.1f "
+                            "transcript=%r kind=%s command=%r"
+                        ),
+                        command_count,
+                        playback_result.elapsed_ms,
+                        interruption.transcript,
+                        interruption.event.kind,
+                        interruption.event.command,
+                    )
+                    ui.user_text(interruption.transcript)
+                    ui.status("interrupted", interruption.transcript)
+                    ui.line(f"interrupted by wake: {interruption.transcript}")
+                else:
+                    logger.info(
+                        "wake_played turn=%d latency_ms=%.1f",
+                        command_count,
+                        playback_ms,
+                    )
             else:
                 playback_ms = 0.0
 
@@ -880,6 +936,7 @@ def run_demo(
 
     from whispertome.audio.playback import SpeakerOutput
     from whispertome.llm.openai_responses import OpenAIResponder
+    from whispertome.text.markdown import parse_spoken_markdown
 
     responder = OpenAIResponder(config.openai)
     speaker = SpeakerOutput() if play else None
@@ -1063,10 +1120,11 @@ def run_demo(
             openai_started = perf_counter()
             llm_response = responder.generate(user_text)
             openai_wall_ms = (perf_counter() - openai_started) * 1000.0
+            spoken_response = parse_spoken_markdown(llm_response.text)
             logger.info(
                 (
                     "demo_openai turn=%d wall_ms=%.1f latency_ms=%.1f model=%s "
-                    "response_id=%s chars=%d text=%r"
+                    "response_id=%s chars=%d speech_chars=%d code_blocks=%d text=%r"
                 ),
                 turn,
                 openai_wall_ms,
@@ -1074,12 +1132,14 @@ def run_demo(
                 llm_response.model,
                 llm_response.response_id,
                 len(llm_response.text),
+                len(spoken_response.speech_text),
+                len(spoken_response.code_blocks),
                 llm_response.text,
             )
-            print(f"Assistant: {llm_response.text}")
+            print(f"Assistant: {spoken_response.display_text}")
 
             tts_started = perf_counter()
-            speech = tts_model.synthesize(llm_response.text)
+            speech = tts_model.synthesize(spoken_response.speech_text)
             tts_wall_ms = (perf_counter() - tts_started) * 1000.0
             logger.info(
                 "demo_tts turn=%d wall_ms=%.1f latency_ms=%.1f provider=%s sample_rate=%d",

@@ -41,6 +41,12 @@ class NullVoiceUi:
     def assistant_text(self, text: str) -> None:
         return
 
+    def code_block(self, language: str, code: str) -> None:
+        return
+
+    def clear_code_block(self) -> None:
+        return
+
     def activity(self, value: float) -> None:
         return
 
@@ -52,6 +58,8 @@ class TerminalUiState:
     status_detail: str = ""
     user: str = ""
     assistant: str = ""
+    code_language: str = ""
+    code_text: str = ""
     activity_value: float = 0.0
     stream_lines: deque[str] = field(default_factory=deque)
 
@@ -70,6 +78,14 @@ class TerminalUiState:
     def set_assistant(self, text: str) -> None:
         self.assistant = text.strip()
 
+    def set_code_block(self, language: str, code: str) -> None:
+        self.code_language = language.strip() or "code"
+        self.code_text = code.strip("\r\n")
+
+    def clear_code_block(self) -> None:
+        self.code_language = ""
+        self.code_text = ""
+
     def set_activity(self, value: float) -> None:
         self.activity_value = max(0.0, min(1.0, float(value)))
 
@@ -85,6 +101,8 @@ class TerminalUiState:
             status_detail=self.status_detail,
             user=self.user,
             assistant=self.assistant,
+            code_language=self.code_language,
+            code_text=self.code_text,
             activity_value=self.activity_value,
             stream_lines=deque(self.stream_lines, maxlen=self.max_lines),
         )
@@ -139,6 +157,15 @@ class TerminalVoiceUi:
         with self._lock:
             self._state.set_assistant(text)
 
+    def code_block(self, language: str, code: str) -> None:
+        with self._lock:
+            self._state.set_code_block(language, code)
+            self._state.add_line(f"rendered {language or 'code'} block")
+
+    def clear_code_block(self) -> None:
+        with self._lock:
+            self._state.clear_code_block()
+
     def activity(self, value: float) -> None:
         with self._lock:
             self._state.set_activity(value)
@@ -161,7 +188,8 @@ def render_frame(state: TerminalUiState, *, width: int, height: int, frame: int)
     available_height = max(24, height)
     content_width = min(width - 4, 112)
     polygon_width = min(58, content_width)
-    polygon_height = 15 if available_height >= 30 else 11
+    has_code = bool(state.code_text)
+    polygon_height = 11 if has_code else 15 if available_height >= 30 else 11
     title = f"{BOLD}{CYAN}WHISPER TO ME{RESET}"
     status = color_for_status(state.status_text) + state.status_text.upper() + RESET
     detail = f" {DIM}{state.status_detail}{RESET}" if state.status_detail else ""
@@ -189,6 +217,10 @@ def render_frame(state: TerminalUiState, *, width: int, height: int, frame: int)
         )
     )
     lines.append("")
+    if has_code:
+        code_height = 8 if available_height >= 34 else 6
+        lines.extend(render_code_box(state, content_width, code_height=code_height, frame=frame))
+        lines.append("")
     lines.extend(render_stream(state, content_width))
     return "\n".join(lines[:available_height]) + "\n"
 
@@ -290,6 +322,49 @@ def render_box(title: str, text: str, width: int, *, color: str) -> list[str]:
     body = [color + "| " + line.ljust(inner) + " |" + RESET for line in wrapped]
     bottom = color + "+" + ("-" * (width - 2)) + "+" + RESET
     return [top, header, *body, bottom]
+
+
+def render_code_box(
+    state: TerminalUiState,
+    width: int,
+    *,
+    code_height: int,
+    frame: int,
+) -> list[str]:
+    width = max(30, width)
+    inner_width = width - 4
+    viewport_height = max(1, code_height - 3)
+    code_lines = state.code_text.splitlines() or [""]
+    wrapped_lines = wrap_code_lines(code_lines, inner_width)
+    max_offset = max(0, len(wrapped_lines) - viewport_height)
+    offset = 0 if max_offset == 0 else (frame // 12) % (max_offset + 1)
+    visible = wrapped_lines[offset : offset + viewport_height]
+    title = f"{state.code_language.upper()} VIEW"
+    if max_offset:
+        title = f"{title} {offset + 1}-{min(offset + viewport_height, len(wrapped_lines))}/{len(wrapped_lines)}"
+    top = YELLOW + "+" + ("-" * (width - 2)) + "+" + RESET
+    header = YELLOW + "| " + title[:inner_width].ljust(inner_width) + " |" + RESET
+    body = [
+        YELLOW + "| " + line[:inner_width].ljust(inner_width) + " |" + RESET
+        for line in visible
+    ]
+    while len(body) < viewport_height:
+        body.append(YELLOW + "| " + "".ljust(inner_width) + " |" + RESET)
+    bottom = YELLOW + "+" + ("-" * (width - 2)) + "+" + RESET
+    return [top, header, *body, bottom]
+
+
+def wrap_code_lines(lines: list[str], width: int) -> list[str]:
+    wrapped: list[str] = []
+    for line in lines:
+        expanded = line.expandtabs(2)
+        if not expanded:
+            wrapped.append("")
+            continue
+        while expanded:
+            wrapped.append(expanded[:width])
+            expanded = expanded[width:]
+    return wrapped
 
 
 def render_stream(state: TerminalUiState, width: int) -> list[str]:

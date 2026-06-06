@@ -15,11 +15,20 @@ missing punctuation, casing errors, homophones, repeated words, partial phrases,
 small recognition mistakes. Infer the most likely intent from context, but ask one short
 clarifying question when a transcript is ambiguous enough that acting would be risky.
 
-Respond for text-to-speech:
+Respond for text-to-speech and terminal display:
 - Keep answers brief, natural, and easy to say out loud.
 - Default to one short sentence. Use two or three only when needed for clarity.
 - Do not mention transcription errors unless they change the meaning.
-- Avoid markdown tables, code blocks, bullet-heavy formatting, URLs, and visual layout.
+- Avoid markdown tables, bullet-heavy formatting, URLs, and visual layout in spoken prose.
+- The text-to-speech stage must not read code, scripts, templates, JSON, YAML, XML,
+  command blocks, or markdown fence syntax aloud.
+- When giving code, scripts, templates, commands, or exact text meant to be copied,
+  write one short spoken lead-in, then put the copyable content in a fenced markdown
+  block. Use a specific language tag such as ```go, ```python, or ```powershell for
+  source code. Use ```script for plain-language scripts or dictated copy.
+- Use at most one fenced block per response unless the user explicitly asks for
+  multiple files, multiple examples, or multiple separate blocks.
+- Never put source code inline in the spoken sentence. Never omit fences around code.
 - When the user is dictating text to be written, preserve their wording as much as possible
   and lightly repair punctuation and obvious speech-recognition errors.
 - When the user gives a command, answer with the result or the next useful question.
@@ -196,7 +205,7 @@ def load_config(project_root: Path | None = None, *, require_openai_key: bool = 
     if require_openai_key and not api_key:
         raise ConfigError("OPENAI_API_KEY is missing. Put it in .env or the process environment.")
 
-    max_output_tokens = _env_int("OPENAI_MAX_OUTPUT_TOKENS", 64)
+    max_output_tokens = _env_int("OPENAI_MAX_OUTPUT_TOKENS", 512)
     stt_onnx_variant = _env("WHISPERTOME_STT_ONNX_VARIANT", "fp32") or "fp32"
     if stt_onnx_variant not in {"fp32", "int8", "auto"}:
         raise ConfigError("WHISPERTOME_STT_ONNX_VARIANT must be fp32, int8, or auto")
@@ -205,7 +214,7 @@ def load_config(project_root: Path | None = None, *, require_openai_key: bool = 
         project_root=root,
         openai=OpenAIConfig(
             api_key=api_key,
-            model=_env("OPENAI_MODEL", "gpt-5.2") or "gpt-5.2",
+            model=_env("OPENAI_MODEL", "gpt-5.5") or "gpt-5.5",
             system_prompt=_env(
                 "OPENAI_SYSTEM_PROMPT",
                 DEFAULT_OPENAI_SYSTEM_PROMPT,

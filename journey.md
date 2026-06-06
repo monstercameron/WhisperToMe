@@ -249,3 +249,51 @@ Commit: `7e3e19f` (`Milestone: initial voice assistant scaffold`)
 
 - Keep the TUI optional via `--tui` so plain log-oriented runs remain available.
 - Keep the renderer pure Python and event-driven so the voice loop does not depend on UI internals.
+
+## Milestone 10: Playback Interruption
+
+### Wins
+
+- Replaced blocking speaker playback with an interruptible playback path backed by a `threading.Event`.
+- Added a playback-time wake monitor that consumes the existing microphone stream while assistant audio is playing, avoiding a second input stream.
+- Kept the interruption detector on the same STT and wake-router path as normal listening.
+- Added TUI states for interruption STT and interruption detected.
+- Logged playback-time transcripts and `wake_playback_interrupted` events for debugging false positives and missed interruptions.
+- Added tests for interruptible speaker stop behavior and wake detection during playback.
+
+### Losses
+
+- Interruption currently stops playback and returns to listening; it does not yet automatically execute a command spoken after the wake phrase during the interruption.
+- Echo from speakers may be captured by the microphone, so interruption wake phrases should be chosen carefully and tested with real speaker volume.
+- Playback-time wake detection still waits for a VAD-delimited utterance before STT can confirm the wake phrase.
+
+### Decisions
+
+- Use the existing microphone iterator during playback rather than opening a second input stream, because some audio devices reject parallel input streams.
+- Treat barge-in command execution as the next step after reliable wake-to-stop interruption is verified.
+
+## Milestone 11: Markdown-Aware TTS and Script Display
+
+### Wins
+
+- Added a markdown parser for fenced code blocks before the TTS stage.
+- Prevented TTS from reading triple-backtick fences, language tags, and code contents aloud.
+- Replaced fenced code in spoken text with a short spoken placeholder such as `I put the script on screen.`
+- Added a TUI code viewport that renders the latest fenced block, preferring `script` blocks when several are present.
+- Made the code viewport auto-scroll when the block is longer than the available box height.
+- Added tests for fenced script parsing, code-only responses, preferred script block selection, and TUI code rendering.
+- Refined the OpenAI prompt so code is display content, not spoken content, and limited normal replies to one fenced code block unless multiple are explicitly requested.
+- Changed the default OpenAI model from `gpt-5.2` to `gpt-5.5`.
+- Raised the default OpenAI output cap from 64 to 512 tokens so short fenced snippets are less likely to be truncated before the closing fence.
+- Added a defensive parser fallback for obvious unfenced code, including the raw `package main` Go FizzBuzz failure shape seen in the TUI.
+
+### Losses
+
+- The TUI code viewport auto-scrolls over time; it does not yet support keyboard-controlled scrolling.
+- Unfenced-code detection is heuristic. It is a TTS safety net, not a replacement for the model following the fenced-block prompt.
+
+### Decisions
+
+- Keep raw OpenAI text in logs, but send only spoken-safe text to TTS.
+- Keep prose in the assistant output panel and move code/script contents to the dedicated TUI viewport.
+- Prefer one larger, copyable block over several smaller blocks unless the user asks for multiple files or examples.

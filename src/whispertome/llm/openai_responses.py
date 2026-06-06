@@ -73,7 +73,14 @@ class OpenAIResponder:
                         "type": "input_text",
                         "text": (
                             "Speech-to-text transcript from the user. "
-                            "Interpret it as spoken dictation or a spoken command:\n"
+                            "Interpret it as spoken dictation or a spoken command.\n\n"
+                            "Voice/TUI output contract: keep spoken prose brief. If your reply "
+                            "includes code, scripts, templates, commands, JSON, YAML, XML, or exact "
+                            "copyable text, put that content in a fenced markdown block after a "
+                            "short spoken lead-in so the app can display it instead of reading it "
+                            "aloud. Use at most one fenced block unless the transcript explicitly "
+                            "asks for multiple files, examples, or blocks.\n\n"
+                            "Transcript:\n"
                             f"{transcript}"
                         ),
                     }

@@ -41,6 +41,7 @@ class OpenAIResponderTests(unittest.TestCase):
         self.assertEqual(call["max_output_tokens"], 50)
         self.assertTrue(call["store"])
         self.assertIn("Speech-to-text transcript", call["input"][0]["content"][0]["text"])
+        self.assertIn("at most one fenced block", call["input"][0]["content"][0]["text"])
         self.assertIn("rite this down", call["input"][0]["content"][0]["text"])
 
     def test_stateful_responder_sends_previous_response_id(self) -> None:

@@ -44,6 +44,7 @@ class ConfigTests(unittest.TestCase):
     def test_voice_defaults_are_latency_oriented(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             old_openai_max = os.environ.pop("OPENAI_MAX_OUTPUT_TOKENS", None)
+            old_openai_model = os.environ.pop("OPENAI_MODEL", None)
             old_stt_max = os.environ.pop("WHISPERTOME_STT_MAX_TOKENS", None)
             old_stt_variant = os.environ.pop("WHISPERTOME_STT_ONNX_VARIANT", None)
             old_stt_prompt = os.environ.pop("WHISPERTOME_STT_PROMPT", None)
@@ -53,6 +54,8 @@ class ConfigTests(unittest.TestCase):
             finally:
                 if old_openai_max is not None:
                     os.environ["OPENAI_MAX_OUTPUT_TOKENS"] = old_openai_max
+                if old_openai_model is not None:
+                    os.environ["OPENAI_MODEL"] = old_openai_model
                 if old_stt_max is not None:
                     os.environ["WHISPERTOME_STT_MAX_TOKENS"] = old_stt_max
                 if old_stt_variant is not None:
@@ -62,7 +65,9 @@ class ConfigTests(unittest.TestCase):
                 if old_speech_end is not None:
                     os.environ["WHISPERTOME_SPEECH_END_MS"] = old_speech_end
 
-            self.assertEqual(config.openai.max_output_tokens, 64)
+            self.assertEqual(config.openai.model, "gpt-5.5")
+            self.assertEqual(config.openai.max_output_tokens, 512)
+            self.assertIn("Use at most one fenced block", config.openai.system_prompt)
             self.assertEqual(config.stt.backend, "qai_whisper")
             self.assertEqual(config.stt.max_tokens, 64)
             self.assertEqual(config.stt.onnx_variant, "fp32")

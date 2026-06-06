@@ -174,6 +174,10 @@ whispertome --project-root C:\Users\mreca\Desktop\whispertome run --allow-non-np
 
 The TUI shows a central animated polygon whose pulse follows input activity, live input/output text panels, and a bounded 1-10 line system stream for states like `listening`, `wake detected`, `transcribing`, `contacting openai`, `running tts`, and `playing speech`. Use `--tui-lines 6` to change the stream height.
 
+Markdown fenced code blocks in OpenAI responses are parsed before TTS. The voice does not read triple-backtick fences or code contents aloud; it says that the code/script is on screen. The system prompt asks for one fenced block per response by default, unless you explicitly ask for multiple files or examples. The TUI renders the latest fenced block, preferring ```script blocks, inside an auto-scrolling code viewport. The parser also catches obvious unfenced code, such as `package main`, as a defensive fallback so raw code is not read aloud.
+
+While assistant audio is playing, the wake loop keeps consuming the microphone stream in a background wake monitor. Say the wake phrase, for example `computer`, to interrupt playback. The monitor runs STT and wake matching concurrently with speaker output, stops audio when the wake phrase is detected, logs `wake_playback_interrupted`, and returns the system to listening.
+
 The default end-of-speech silence is `WHISPERTOME_SPEECH_END_MS=1200`, which gives room for short thinking pauses, "um", and "ah" without cutting a sentence in half. For live tuning:
 
 ```powershell
@@ -292,6 +296,8 @@ Implemented:
 - `demo` command for microphone -> STT -> OpenAI -> TTS -> speaker conversation testing with per-run logs.
 - `run` command for the continuous wake phrase loop with per-run logs and optional utterance audio capture.
 - Optional `run --tui` terminal UI with central polygon animation, input/output text, and a bounded system state stream.
+- Markdown-aware TTS text preparation that suppresses fenced and obvious unfenced code blocks and renders script/code blocks in the TUI.
+- Interruptible assistant playback with concurrent STT wake detection during spoken output.
 - Speech-pause-delimited demo recording with stage-level profiling and clipping warnings.
 - Whisper ONNX split encoder/decoder adapter with Hugging Face feature extraction and tokenizer decoding.
 - Kokoro ONNX TTS adapter using the real `kokoro-onnx` tokenizer, phonemizer, voices, and injected NPU-only ONNX session.
@@ -337,7 +343,8 @@ The OpenAI layer is wired through the Responses API:
 - `input` is a user message containing the speech-to-text transcript.
 - `previous_response_id` is used for stateful turns when enabled.
 - `test-openai` verifies the API key, selected model, prompt, and response parsing.
-- Spoken replies default to `OPENAI_MAX_OUTPUT_TOKENS=64` unless overridden.
+- The default model is `gpt-5.5`.
+- Spoken replies stay brief by prompt; `OPENAI_MAX_OUTPUT_TOKENS=512` leaves room for short fenced code blocks unless overridden.
 
 Realtime/WebSocket is not the default path yet. It remains the right future option if we switch to lower-latency cloud speech-to-speech or realtime audio transcription, but the current architecture keeps local STT/TTS plus a text Responses API turn.
 
