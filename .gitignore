@@ -23,12 +23,19 @@ artifacts/
 tmp/
 scratch/
 junk/
-research/
 experiments/
 experiment*/
-notes.md
 *.tmp
 *.bak
 *.swp
 Thumbs.db
 .DS_Store
+
+# Research workspace outputs and experiment code
+research/**/_out/
+research/**/outputs/
+research/**/*.py
+research/**/*.onnx
+research/**/*.ort
+research/**/*.wav
+research/**/*.log

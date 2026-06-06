@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WhisperToMe</title>
+    <meta
+      name="description"
+      content="WhisperToMe is a 24/7 Windows voice assistant optimized for Snapdragon X2 Elite, local Whisper STT, local TTS goals, desktop UI, organizer tools, and runtime-swappable LLM providers."
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="../README.md">WhisperToMe</a>
+      <nav aria-label="Project navigation">
+        <a href="#mission">Mission</a>
+        <a href="#journey">Journey</a>
+        <a href="#research">Research</a>
+        <a href="GETTING_STARTED.md">Start</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero" id="mission">
+        <div class="hero-copy">
+          <p class="eyebrow">Snapdragon X2 Elite voice rig</p>
+          <h1>A 24/7 assistant for Snapdragon desktops.</h1>
+          <p class="lede">
+            WhisperToMe is being tuned for an always-on Windows background loop:
+            local Whisper STT on the Snapdragon NPU, low-latency model calls,
+            local TTS goals, desktop controls, and a cockpit UI that shows every
+            stage of the conversation.
+          </p>
+          <div class="actions">
+            <a class="button primary" href="GETTING_STARTED.md">Run The Demo</a>
+            <a class="button secondary" href="../research/journey.md">Read The Journey</a>
+          </div>
+        </div>
+
+        <div class="console-visual" aria-label="WhisperToMe status preview">
+          <div class="window-bar">
+            <span></span>
+            <span></span>
+            <span></span>
+            <strong>WhisperToMe</strong>
+          </div>
+
+          <div class="hardware-strip">
+            <span>Snapdragon X2 Elite</span>
+            <span>QNN HTP</span>
+            <span>24/7 background</span>
+          </div>
+
+          <div class="signal-core">
+            <i></i>
+            <i></i>
+            <i></i>
+            <i></i>
+            <i></i>
+            <i></i>
+          </div>
+
+          <div class="transcript-card input-card">
+            <b>INPUT</b>
+            <span>computer, what is up next?</span>
+          </div>
+          <div class="transcript-card output-card">
+            <b>OUTPUT</b>
+            <span>You have prototype review at 10. Want the checklist?</span>
+          </div>
+
+          <div class="status-feed">
+            <span>listening in tray</span>
+            <span>wake detected</span>
+            <span>qnn whisper small: warm</span>
+            <span>streaming speech</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="metric-row" aria-label="Project targets and current measurements">
+        <article>
+          <b>Target Device</b>
+          <span>Snapdragon X2 Elite</span>
+        </article>
+        <article>
+          <b>Background Mode</b>
+          <span>24/7 tray resident</span>
+        </article>
+        <article>
+          <b>Warm STT</b>
+          <span>294-318 ms saved clips</span>
+        </article>
+        <article>
+          <b>Wake Phrase</b>
+          <span>arbitrary, currently computer</span>
+        </article>
+      </section>
+
+      <section class="section">
+        <div class="section-heading">
+          <p class="eyebrow">What it does</p>
+          <h2>A voice loop with a real desktop body.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3>Always warm</h3>
+            <p>Continuous microphone capture, VAD segmentation, sliding wake phrase detection, and speech-pause command capture.</p>
+          </article>
+          <article>
+            <h3>Local speech first</h3>
+            <p>Whisper STT runs through modular backends with a strict no CPU/GPU fallback policy for production local inference.</p>
+          </article>
+          <article>
+            <h3>Fast model swaps</h3>
+            <p>OpenAI Responses and Cerebras can be selected at runtime without deleting either integration.</p>
+          </article>
+          <article>
+            <h3>Useful memory</h3>
+            <p>SQLite-backed notes, preferences, reminders, tasks, checklists, itinerary, projects, decisions, and people notes.</p>
+          </article>
+          <article>
+            <h3>Interruptible speech</h3>
+            <p>Streaming responses feed sentence-level TTS chunks while the wake monitor keeps listening for interruptions.</p>
+          </article>
+          <article>
+            <h3>Windows-aware</h3>
+            <p>Tray behavior, volume ducking, brightness and volume tools, desktop capture, and guarded PowerShell commands.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section timeline-section" id="journey">
+        <div class="section-heading">
+          <p class="eyebrow">Build journey</p>
+          <h2>Wins, losses, and the path to a real assistant.</h2>
+          <p>
+            The project has been developed through manual voice testing, log
+            review, latency profiling, and milestone commits. These are the
+            parts that shaped the current architecture.
+          </p>
+        </div>
+
+        <div class="timeline">
+          <article>
+            <span>01</span>
+            <h3>Scaffolded the voice stack</h3>
+            <p>Split audio, STT, TTS, runtime, wake, LLM, and pipeline code into clean modules. Added `.env`, arbitrary wake phrases, doctor checks, and test commands.</p>
+          </article>
+          <article>
+            <span>02</span>
+            <h3>Found the working STT lane</h3>
+            <p>Moved from rough debug Whisper trials to Qualcomm AI Hub Whisper-Small precompiled QNN ONNX for Snapdragon X2 Elite.</p>
+          </article>
+          <article>
+            <span>03</span>
+            <h3>Cut local latency</h3>
+            <p>Kept STT and TTS objects warm. After a one-time QNN warmup, saved short-turn STT runs matched model time at roughly 294-318 ms.</p>
+          </article>
+          <article>
+            <span>04</span>
+            <h3>Hardened wake detection</h3>
+            <p>Reworked wake matching into token windows with stale-match protection, fuzzy spans, split-utterance support, and better command extraction.</p>
+          </article>
+          <article>
+            <span>05</span>
+            <h3>Built the desktop shell</h3>
+            <p>Added the animated TUI, startup loading animation, tray behavior, centered 800x600 host window, graceful stop/close, and wake-triggered restore.</p>
+          </article>
+          <article>
+            <span>06</span>
+            <h3>Gave it local memory</h3>
+            <p>Added SQLite tools for notes, preferences, reminders, checklists, itinerary, tasks, projects, decisions, people, and time-sensitive up-next checks.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="split section" id="research">
+        <div>
+          <p class="eyebrow">Research lab</p>
+          <h2>What has been proven, and what is still hard.</h2>
+          <p>
+            WhisperToMe is not pretending every model already lands cleanly on
+            the NPU. The project keeps the product loop moving while isolating
+            the research problems that need real artifacts or provider support.
+          </p>
+        </div>
+        <div class="research-board">
+          <article class="good">
+            <b>Proven</b>
+            <p>QNN provider discovery works on Windows ARM64, exposes a Qualcomm NPU device, and runs the current `qai_whisper` STT path.</p>
+          </article>
+          <article class="good">
+            <b>Proven</b>
+            <p>Qualcomm AI Hub Whisper-Small is the current production STT candidate for Snapdragon X2 Elite.</p>
+          </article>
+          <article class="warning">
+            <b>Blocked</b>
+            <p>Stock Kokoro ONNX fails strict QNN HTP initialization because dynamic internal shapes are rejected.</p>
+          </article>
+          <article class="warning">
+            <b>Blocked</b>
+            <p>Freezing public token length was not enough; a proper static-shape or compatible QNN-context TTS artifact is still needed.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="split section architecture-section">
+        <div>
+          <p class="eyebrow">Architecture</p>
+          <h2>Built for swapping parts without rewriting the assistant.</h2>
+          <p>
+            The local speech loop, provider policy, LLM layer, organizer tools,
+            Windows controls, and UI state stream all have their own boundaries.
+            That is what made it possible to try OpenAI, Cerebras, QNN Whisper,
+            debug Kokoro, wake interruption, and desktop capture in the same app.
+          </p>
+        </div>
+        <pre class="code-map"><code>mic -> vad -> whisper -> wake -> llm -> tts -> speakers
+               |          |      |      |
+               |          |      |      + markdown-safe speech
+               |          |      + tools + desktop capture
+               |          + tui state stream
+               + 24/7 tray-resident background loop</code></pre>
+      </section>
+
+      <section class="section callout">
+        <p class="eyebrow">Current milestone</p>
+        <h2>The desktop assistant loop is alive.</h2>
+        <p>
+          Wake phrase, animated TUI, tray-hosted window, audio ducking, organizer
+          tools, desktop capture, OpenAI/Cerebras switching, and interruption
+          handling are in place. Next frontier: a fully NPU-safe local TTS path
+          for the Snapdragon X2 Elite target so the 24/7 loop can stay efficient
+          all day.
+        </p>
+      </section>
+    </main>
+  </body>
+</html>

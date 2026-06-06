@@ -597,3 +597,250 @@ Commit: `7e3e19f` (`Milestone: initial voice assistant scaffold`)
 - Fail fast on Cerebras provider errors in the voice loop instead of letting SDK retry sleeps block interruption handling.
 - Treat LLM/tool-loop errors as recoverable turn failures with short spoken feedback.
 - Prefer dedicated system tools for volume, brightness, window, and desktop capture; reserve PowerShell for explicit local inspection gaps.
+
+## Milestone 23: Kokoro NPU TTS — Root-Causing the Dynamic Shape (In Progress)
+
+Work isolated under `research/kokoro_npu/` (diagnostic-only scripts; no changes to
+the `whispertome` package). Targets the Kokoro path only; the supertonic2 QNN
+effort is owned elsewhere and left untouched.
+
+### Wins
+
+- Built three reusable diagnostic tools that run on the verified ARM64 QNN venv:
+  - `diagnose.py` — enumerates graph inputs/outputs, every value_info tensor with a
+    symbolic/dynamic dim, the distinct symbolic dim params, and attempts a real QNN
+    HTP session with `session.disable_cpu_ep_fallback=1` to capture the exact error.
+  - `trace.py` — walks backwards from any tensor to its producers/inputs, printing
+    inferred shapes, to locate where dynamism originates.
+  - `make_static.py` — symbolic-shape-inference + batch-axis forcing pass (WIP).
+- Captured the exact QNN rejection on `kokoro-v1.0-seq512-inferred.onnx`:
+  `EP_FAIL : Dynamic shape is not supported yet, for input: /encoder/shared/Transpose_output_0`.
+- Proved the "1609 dynamic internal tensors" are actually TWO different things:
+  - The vast majority are the **batch axis** left symbolic (`<unk__357>`, `<unk__344>`,
+    `<unk__315>` …). The sequence axis is already static at 512 after the seq-fix.
+    These are statically fixable (batch = 1).
+  - One family, `<unk__368>`, is the **data-dependent output frame count** and is the
+    real blocker.
+- Traced `<unk__368>` to its origin. It is the StyleTTS2 length regulator:
+  `predictor.ReduceSum(durations)` → `Div by speed` input → `Round` → `Clip` →
+  `CumSum` → take last element (total frames) → `Range(0, total_frames)`. That length
+  then flows UP through the alignment `MatMul` (`/encoder/MatMul_output_0`
+  `[<unk__357>,640,<unk__368>]`) and into the decoder/vocoder, so it is not a tail-only
+  dynamic dim — it is baked through the second half of the graph.
+
+### Losses
+
+- Freezing `tokens` to `[1,512]` can never make Kokoro fully static: it fixes the
+  input phoneme axis but the output time axis is `sum(round(predicted_durations/speed))`,
+  computed at inference time from the text and the `speed` input.
+- ONNX Runtime `SymbolicShapeInference` crashes on this graph
+  (`_infer_Gather: object of type 'NoneType' has no len()`) because an upstream tensor
+  has unknown rank, so the easy "just re-infer shapes" route does not finish.
+- Therefore the README's existing seq-512 artifacts (`-seq512`, `-seq512-inferred`)
+  cannot load on QNN as-is, which matches the QNN error above.
+
+### Findings / Decisions
+
+- The only QNN-loadable Kokoro paths are: (a) graph surgery to replace the
+  duration-driven `Range` length with a constant `MAX_FRAMES` (pad the alignment,
+  trim trailing silence on CPU using the real total) — feasible here with no PyTorch;
+  or (b) a fixed-max-length + mask re-export from the PyTorch source — blocked because
+  there is still no PyTorch wheel for this Windows ARM64 Python; or (c) split the graph
+  at the length regulator (encoder+duration on NPU, expansion on CPU, decoder on NPU
+  with fixed frames) — the supertonic-style approach.
+- Chosen next step: attempt path (a), constant-`MAX_FRAMES` graph surgery, because it
+  is the only fully-NPU option that does not require the blocked PyTorch toolchain.
+
+### Next Steps
+
+- Force the batch family (`<unk__357>` et al.) to 1 across inputs and value_info.
+- Replace the `Range` limit feeding `<unk__368>` with a constant `MAX_FRAMES`; keep the
+  real total-frame scalar as a second output so CPU can trim the padded audio.
+- Re-run `diagnose.py` to confirm zero remaining dynamic tensors, then re-attempt the
+  QNN HTP load and verify no CPU-assigned nodes.
+
+### Update: shapes are solvable, correctness is not (the real wall)
+
+The `surgery.py` constant-`MAX_FRAMES` pass works mechanically (`<unk__368>` is gone),
+but running the seq-512 graph on CPU exposed a deeper, fatal problem that pure ONNX
+surgery cannot fix:
+
+- Measured the real frame geometry: hop = 600 samples/frame at 24 kHz. The reference
+  utterance "Hello from WhisperToMe." (29 wrapped tokens) is 57 frames / 1.43 s.
+- The same text right-padded to 512 tokens produces **578 frames / 14.45 s** — the 483
+  pad tokens (token id `0`, which is also bos/eos) each receive a nonzero predicted
+  duration. Kokoro has no padding/attention-mask input, so padding is not ignored.
+- Energy profile of the padded output: 402 of 578 frames are audibly loud, spread
+  across the whole clip — not "content then silence." `corr(reference, padded) =
+  0.0046` (essentially uncorrelated). Right-padding corrupts the entire utterance.
+- Isolated the cause: compared the BERT/ALBERT encoder output for the real tokens,
+  unpadded vs padded. `max|diff| = 2.58`, `mean = 0.31` over `[1,29,768]` (~57% of
+  signal magnitude). So the encoder self-attention AND the bidirectional text-encoder
+  LSTM mix pad tokens into the real tokens. The contamination is upstream of durations,
+  so masking durations alone cannot recover correct audio.
+- Important correction: there are two `Range` nodes; only `/encoder/Range` is the
+  duration-driven frame axis. `Range_6494` is a tiny indexing arange inside the iSTFT
+  (output shape `(1,)`); pinning it to `MAX_FRAMES` is what broke the vocoder iSTFT with
+  `Incompatible dimensions`. Surgery must target `/encoder/Range` only.
+
+### Revised conclusion / decision
+
+- Freezing tokens to 512 cannot yield correct NPU Kokoro by ONNX surgery alone. A static
+  512 graph is only correct if pad tokens are truly masked, which requires: BERT
+  attention masking, the ONNX LSTM `sequence_lens` input wired to a real length, and a
+  duration mask — i.e. effectively a re-export with a proper attention mask and a fixed
+  max length from the PyTorch source.
+- Re-checked torch on this machine (2026-06-06): still no `torch` wheel for Windows
+  ARM64 cp312 (`pip` finds no distribution), so the clean re-export cannot be done here.
+- Therefore the realistic options are: (a) re-export Kokoro with mask + fixed max length
+  on an x64/Linux box that has PyTorch, then bring the static ONNX back; (b) high-effort
+  in-graph mask surgery (attention mask + LSTM `sequence_lens` + duration mask), correctness
+  verified per-stage against the dynamic model — risky and slow; or (c) keep TTS on the
+  fast CPU path (already real-time) and accept it is not on the NPU, treating the all-day
+  power goal as satisfied by STT-on-NPU for now. All diagnostic tooling lives in
+  `research/kokoro_npu/` for whoever picks this up.
+
+### Existing-export survey (does a right-shaped ONNX already exist?)
+
+- The publicly downloadable Kokoro ONNX models — `onnx-community/Kokoro-82M-ONNX` and
+  `-v1.0-ONNX`, `thewh1teagle/kokoro-onnx` (our current source), `NeuML/kokoro-*-onnx` —
+  all use a **dynamic token axis with no mask/length input**. Same problem as ours; none
+  are the right shape for QNN, and none can be safely right-padded (see contamination
+  measurement above).
+- The correct approach is published as **export pipelines, not prebuilt files**:
+  - `NimbleEdge/kokoro` rebuilds Kokoro as a static graph with an `input_lengths` input
+    and recomputes attention masks after every upsample — i.e. it adds exactly the
+    padding mask our graph lacks. `export_onnx.py` produces `kokoro_batched_quantized.onnx`.
+    No prebuilt ONNX is published; the README does not state whether the token axis is
+    pinned to a fixed size, so the exporter would need to be run with a fixed seq (512).
+  - `adrianlyjak/kokoro-onnx-export` is a second, similar mask-based export script set.
+- Both require PyTorch to run, which is unavailable on this ARM64 Windows box. Recommended
+  path: run `NimbleEdge/kokoro`'s exporter on any torch-capable machine with a fixed
+  token length + `input_lengths`, then bring the ONNX back here and QNN-load it. This is
+  strictly better than in-graph surgery because the mask correctness comes from the source.
+
+> NOTE: root `journey.md` was deleted by a parallel agent's docs restructure at ~16:21
+> (a new `docs/` site appeared). This copy under `research/journey.md` preserves the
+> Kokoro/Supertonic NPU-TTS findings (Milestones 23-24) so they are not lost. Merge back
+> into the canonical journey/docs once the restructure settles.
+
+## Milestone 24: Supertonic NPU Load-Probe (Isolated, Read-Only)
+
+Goal: answer the open question from Milestone 1 — do the Supertonic precompiled QNN
+context artifacts load on THIS machine's onnxruntime-qnn 2.2.0 / QnnHtp build? Done as
+an isolated read-only probe (`research/supertonic_npu/`, on copies); the live Supertonic
+work in `models/supertonic2/` belongs to another effort and was not modified.
+
+### Wins (signal gathered)
+
+- Confirmed Supertonic's text_encoder is architecturally NPU-ready: the `_net.json`
+  `converter_command` shows a clean QAIRT `qnn-onnx-converter` run — INT8 QDQ (8-bit
+  act/weight/bias, asymmetric, min-max calibration with a real calibration list), fully
+  static input dims (`text_ids 1,128`, `style_ttl 1,50,256`, `text_mask 1,1,128`),
+  `unroll_lstm_time_steps=True`. It has a proper `text_mask` input — the mask design
+  Kokoro lacks. This is the right approach.
+- The context-ONNX I/O is static and sensible:
+  `text_ids[1,128]`, `text_mask_dq[1,128,1]`, `style_ttl_dq[1,256,50]` -> `text_emb_dq[1,128,256]`.
+
+### Losses (both ctx ONNX fail to load on this build)
+
+- `text_encoder_htp_net_qnn_ctx.onnx` is **opset 26**; ORT 1.24.4 rejects it at
+  `ValidateOpsetForDomain` (opset too new). The `_op20` variant (opset 20) passes that check.
+- `text_encoder_htp_net_qnn_ctx_op20.onnx` then fails inside QNN with
+  `LoadQnnCtxFromOnnxGraph: Failed to get context binary info` — the same error class as
+  Milestone 1, already special-cased in `runtime/onnx_session.py`. The EPContext wrapper
+  reports `ep_sdk_version = unknown`; ORT-QNN uses that field to validate the embedded
+  binary, so an unstamped/mismatched version makes the context unreadable.
+- Online ORT-QNN compile of the *dynamic source* `text_encoder.onnx` fails with
+  "nodes assigned to the default CPU EP" under no-fallback — the online partitioner will
+  not claim every node. Confirms the offline QAIRT route was the correct choice; online
+  compilation is a dead end here.
+
+### Environment facts
+
+- `onnxruntime-qnn 2.2.0` bundles HTP stubs/skels for **V68, V73, V81** (plus a V79 stub).
+  The compiled binary's target HTP arch must be one of these AND match the X2 Elite's
+  Hexagon version or it will not load.
+
+### Findings / hand-off for the Supertonic effort
+
+- The `.bin` looks correctly built; the failure is in the **EPContext wrapper / context-
+  binary version metadata**, not the model graph. Two concrete fixes to try:
+  1. Regenerate the context with a QAIRT SDK version matched to onnxruntime-qnn 2.2.0's
+     QNN libs (confirm HTP arch is V68/V73/V81) so `ep_sdk_version` is stamped/readable.
+  2. Or have ORT-QNN itself produce the EPContext (`ep.context_enable=1`) from a static
+     QDQ ONNX, so the wrapper metadata is written by the same stack that reads it.
+- Only `text_encoder` is wrapped to a ctx ONNX so far; `duration_predictor`,
+  `vector_estimator`, `vocoder` have `.bin`+`.json` but no ctx ONNX yet — the full 4-stage
+  pipeline still needs wrapping + a CPU glue runner between stages.
+
+### BREAKTHROUGH: all 4 stages run on the X2 NPU from the fp source (no version-matched binary needed)
+
+The precompiled-binary version mismatch turned out to be a non-issue: the dynamic-shape
+failure was the *only* real blocker. Static-fixing each source ONNX to the QAIRT dims and
+letting **this machine's** ORT-QNN compile it fresh on HTP works for every stage, and the
+fp16 HTP output matches CPU fp32:
+
+| stage | HTP load (no CPU fallback) | CPU↔NPU corr | rel L2 |
+|-------|----------------------------|--------------|--------|
+| text_encoder       | OK | 0.99998 | 0.0066 |
+| duration_predictor | OK | 1.00000 | 0.0007 |
+| vector_estimator   | OK | 1.00000 | 0.0020 |
+| vocoder            | OK | 0.99978 | 0.0220 |
+
+Pipeline contract (fixed dims chosen by the QAIRT compile; masks handle padding):
+- text_encoder: `text_ids[1,128]`, `style_ttl[1,50,256]`, `text_mask[1,1,128]` -> `text_emb[1,256,128]`
+- duration_predictor: `text_ids[1,128]`, `style_dp[1,8,16]`, `text_mask[1,1,128]` -> `duration[128]`
+- vector_estimator (flow-matching velocity field, iterated `total_step` times):
+  `noisy_latent[1,144,192]`, `text_emb[1,256,128]`, `style_ttl[1,50,256]`,
+  `latent_mask[1,1,192]`, `text_mask[1,1,128]`, `current_step`(f32), `total_step`(f32)
+  -> `denoised_latent[1,144,192]`
+- vocoder: `latent[1,144,192]` -> `wav_tts` (589,824 samples for 192 frames -> hop 3072)
+- Fixed maxima: text_length=128, latent/frame_length=192, latent_dim=144.
+
+Implication: do NOT reuse the version-mismatched `.bin`/ctx artifacts. The correct
+on-device recipe is static-fix source -> ORT-QNN fresh compile (optionally cache via
+`ep.context_enable=1` so warmup is paid once). fp16 is accurate enough; INT8 QDQ is a
+later optimization, not required to run.
+
+### Remaining for end-to-end NPU TTS (CPU glue, ~not started)
+
+- Tokenization + style: `model/onnx/unicode_indexer.json`, `tts.json` (config), style vectors.
+- Length regulation on CPU: expand `text_emb` by predicted `duration` into the 192-frame
+  latent layout and build `latent_mask` (this is the variable-length step Kokoro couldn't
+  make static; Supertonic keeps it on CPU between static NPU stages — the key design win).
+- Flow-matching integration loop on CPU: init `noisy_latent` from noise, call
+  vector_estimator for `current_step` in 0..total_step, integrate to `denoised_latent`.
+- Feed final latent to vocoder -> audio. All four NPU calls are static; only the glue is CPU.
+- App integration (TTS backend) is the parallel agent's domain — keep this as a standalone
+  isolated runner in `research/supertonic_npu/` and hand them the verified recipe.
+
+### END-TO-END NPU TTS WORKING (`run_e2e.py`, `correctness_e2e.py`)
+
+Built the full pipeline on the NPU using the reference glue from
+`models/supertonic2/supertonic_inference.py` (tokenize via `unicode_indexer[ord(c)]` +
+`<lang>` tags; precomputed `voice_styles/M1.json` etc.; CPU length-regulation; 10-step
+flow-matching loop; vocoder; trim). Inputs padded to text=128 / frames=192 with masks.
+Audio params: sample_rate 44100, chunk 512*6=3072 samples/frame, latent_dim 144.
+
+Latency (test sentence, 6.32 s of audio, 10 diffusion steps), steady-state:
+| engine | synth time | RTF | note |
+|--------|-----------|-----|------|
+| Supertonic on **NPU (HTP)**   | **~605 ms** | **0.096** (~10x realtime) | dp 3ms, te 7ms, ve_loop(10) 547ms, vo 43ms |
+| Supertonic on CPU (reference) | ~2457 ms | 0.389 | ~4x slower than NPU |
+| Kokoro on CPU (current app)   | ~949 ms (5.1 s audio) | 0.186 | ~1.6x slower than NPU |
+
+NPU session init+compile (one-time warmup) ~17.7 s — should be cached via
+`ep.context_enable=1` so it is paid once, not per run.
+
+Correctness (apples-to-apples, identical noise — waveform corr is meaningless across
+different random init, so seed both sides):
+- NPU-padded vs CPU-padded = **0.98** (fp16 EP fidelity through the 10-step loop)
+- CPU-padded vs CPU-reference = **0.95** (padding+masking == dynamic reference)
+- NPU-padded vs CPU-reference = **0.92** (end-to-end)
+Audio played back fine on speakers; the diffusion loop (`vector_estimator` x steps) is
+~90% of NPU time, so fewer steps trade quality for latency.
+
+Net: Supertonic is the TTS that runs on this X2 NPU today — fastest of the three AND
+off-CPU (the all-day-power goal). Remaining: cache the HTP context (warmup), then the
+parallel agent can wire it in as a `TextToSpeechModel` backend.
