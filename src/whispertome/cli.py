@@ -42,6 +42,41 @@ class RecordingResult:
     speech_end_ms: int | None
 
 
+@dataclass(frozen=True)
+class QueuedInterruptionCommand:
+    command: str
+    transcript: str
+    stt_wall_ms: float
+    stt_latency_ms: float
+
+
+@dataclass(frozen=True)
+class CommandTurnResult:
+    stop_requested: bool = False
+    queued_command: QueuedInterruptionCommand | None = None
+
+
+def _fmt_ms(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1f}"
+
+
+def _queued_interruption_command(interruption: Any | None) -> QueuedInterruptionCommand | None:
+    if interruption is None:
+        return None
+    event = getattr(interruption, "event", None)
+    if getattr(event, "kind", None) != "command_ready":
+        return None
+    command = (getattr(event, "command", None) or "").strip()
+    if not command:
+        return None
+    return QueuedInterruptionCommand(
+        command=command,
+        transcript=getattr(interruption, "transcript", ""),
+        stt_wall_ms=float(getattr(interruption, "wall_ms", 0.0)),
+        stt_latency_ms=float(getattr(interruption, "stt_latency_ms", 0.0)),
+    )
+
+
 class FallbackTextToSpeechModel(TextToSpeechModel):
     def __init__(
         self,
@@ -357,6 +392,11 @@ def add_live_loop_args(parser: argparse.ArgumentParser) -> None:
         help="Do not play assistant TTS audio.",
     )
     parser.add_argument(
+        "--no-stream-tts",
+        action="store_true",
+        help="Use the older batch OpenAI -> TTS path instead of streaming sentence chunks.",
+    )
+    parser.add_argument(
         "--tui",
         action="store_true",
         help="Render a live terminal UI instead of console log lines.",
@@ -418,6 +458,7 @@ def main(argv: list[str] | None = None) -> int:
                 vad_threshold=args.vad_threshold,
                 use_tui=args.tui,
                 tui_lines=args.tui_lines,
+                stream_tts=not args.no_stream_tts,
             )
         if args.command == "demo":
             config = apply_cli_overrides(
@@ -581,6 +622,7 @@ def run_wake_loop(
     vad_threshold: float | None,
     use_tui: bool = False,
     tui_lines: int = 10,
+    stream_tts: bool = True,
 ) -> int:
     if max_commands < 0:
         raise WhisperToMeError("turns must be greater than or equal to 0")
@@ -605,6 +647,8 @@ def run_wake_loop(
     from whispertome.audio.vad import EnergyVad, UtteranceSegmenter
     from whispertome.llm.openai_responses import OpenAIResponder
     from whispertome.text.markdown import parse_spoken_markdown
+    from whispertome.text.streaming import SpokenTextChunker
+    from whispertome.tts.streaming import StreamingSpeechPlayer, concatenate_speech
     from whispertome.ui.terminal import NullVoiceUi, TerminalVoiceUi
     from whispertome.wake.interruptions import PlaybackWakeMonitor
 
@@ -665,6 +709,344 @@ def run_wake_loop(
         command_count = 0
         chunks = MicrophoneInput(config.audio).chunks()
         utterances = segmenter.utterances(chunks)
+
+        def run_command_turn(
+            command: str,
+            *,
+            utterance_index: int,
+            source: str,
+            source_transcript: str,
+            utterance_started: float,
+            stt_wall_ms: float,
+            stt_latency_ms: float,
+        ) -> CommandTurnResult:
+            nonlocal command_count
+            command = command.strip()
+            if not command:
+                return CommandTurnResult()
+
+            command_count += 1
+            ui.user_text(command)
+            ui.status("wake detected", f"command {command_count}")
+            logger.info(
+                "wake_command turn=%d utterance=%d source=%s command=%r transcript=%r",
+                command_count,
+                utterance_index,
+                source,
+                command,
+                source_transcript,
+            )
+            if not use_tui:
+                print(f"You: {command}")
+            if command.lower() in {"q", "quit", "exit", "stop"}:
+                logger.info("wake_command_quit turn=%d", command_count)
+                return CommandTurnResult(stop_requested=True)
+
+            queued_command: QueuedInterruptionCommand | None = None
+
+            if stream_tts:
+                ui.status("streaming openai", config.openai.model)
+                chunker = SpokenTextChunker()
+                interrupt_monitor = None
+                if speaker is not None:
+                    interrupt_monitor = PlaybackWakeMonitor(
+                        config=config,
+                        chunks=chunks,
+                        stt_model=stt_model,
+                        min_speech_ms=min_speech_ms,
+                        vad_threshold=active_vad_threshold,
+                        logger=logger,
+                        status_callback=ui.status,
+                    )
+                    interrupt_monitor.start()
+                player = StreamingSpeechPlayer(
+                    tts_model=tts_model,
+                    speaker=speaker,
+                    interrupt_event=(
+                        interrupt_monitor.interrupt_event
+                        if interrupt_monitor is not None
+                        else None
+                    ),
+                    logger=logger,
+                    status_callback=ui.status,
+                )
+
+                def on_openai_delta(delta: str) -> None:
+                    for text_chunk in chunker.push(delta):
+                        logger.info(
+                            "wake_stream_tts_text turn=%d chars=%d text=%r",
+                            command_count,
+                            len(text_chunk),
+                            text_chunk,
+                        )
+                        ui.line(f"tts queued: {text_chunk}")
+                        player.enqueue_text(text_chunk)
+                    partial_display = parse_spoken_markdown(chunker.raw_text).display_text
+                    if partial_display:
+                        ui.assistant_text(partial_display)
+
+                openai_started = perf_counter()
+                try:
+                    llm_response = responder.generate_stream(
+                        command,
+                        on_delta=on_openai_delta,
+                    )
+                    openai_wall_ms = (perf_counter() - openai_started) * 1000.0
+                    for text_chunk in chunker.finish():
+                        logger.info(
+                            "wake_stream_tts_text turn=%d chars=%d final=true text=%r",
+                            command_count,
+                            len(text_chunk),
+                            text_chunk,
+                        )
+                        ui.line(f"tts queued: {text_chunk}")
+                        player.enqueue_text(text_chunk)
+                    stream_result = player.finish()
+                except Exception:
+                    player.cancel()
+                    raise
+                finally:
+                    if interrupt_monitor is not None:
+                        interrupt_monitor.stop()
+
+                spoken_response = parse_spoken_markdown(llm_response.text)
+                ui.assistant_text(spoken_response.display_text)
+                code_block = spoken_response.primary_code_block
+                if code_block is not None:
+                    ui.code_block(code_block.language, code_block.code)
+                    logger.info(
+                        "wake_response_code_block turn=%d language=%s chars=%d",
+                        command_count,
+                        code_block.language,
+                        len(code_block.code),
+                    )
+                else:
+                    ui.clear_code_block()
+                ui.line(f"openai: {spoken_response.display_text}")
+                logger.info(
+                    (
+                        "wake_openai_stream turn=%d wall_ms=%.1f latency_ms=%.1f "
+                        "model=%s response_id=%s chars=%d speech_chars=%d "
+                        "code_blocks=%d chunks=%d first_text_ms=%s first_audio_ms=%s "
+                        "first_playback_ms=%s text=%r"
+                    ),
+                    command_count,
+                    openai_wall_ms,
+                    llm_response.latency_ms,
+                    llm_response.model,
+                    llm_response.response_id,
+                    len(llm_response.text),
+                    len(spoken_response.speech_text),
+                    len(spoken_response.code_blocks),
+                    stream_result.chunk_count,
+                    _fmt_ms(stream_result.first_text_ms),
+                    _fmt_ms(stream_result.first_audio_ms),
+                    _fmt_ms(stream_result.first_playback_ms),
+                    llm_response.text,
+                )
+                if not use_tui:
+                    print(f"Assistant: {spoken_response.display_text}")
+
+                tts_wall_ms = stream_result.synthesis_ms
+                tts_model_ms = sum(chunk.latency_ms for chunk in stream_result.chunks)
+                playback_ms = stream_result.playback_ms
+                logger.info(
+                    (
+                        "wake_streaming_tts turn=%d chunks=%d total_ms=%.1f "
+                        "synthesis_ms=%.1f model_ms=%.1f playback_ms=%.1f "
+                        "audio_ms=%d provider=%s sample_rate=%s interrupted=%s"
+                    ),
+                    command_count,
+                    stream_result.chunk_count,
+                    stream_result.total_ms,
+                    stream_result.synthesis_ms,
+                    tts_model_ms,
+                    stream_result.playback_ms,
+                    stream_result.total_audio_ms,
+                    stream_result.provider,
+                    stream_result.sample_rate,
+                    stream_result.interrupted,
+                )
+                if save_audio:
+                    assistant_path = audio_dir / f"turn-{command_count:03d}-assistant.wav"
+                    combined_speech = concatenate_speech(stream_result.chunks)
+                    if combined_speech is not None:
+                        save_audio_buffer(combined_speech, assistant_path)
+                        logger.info(
+                            "wake_assistant_audio turn=%d path=%s chunks=%d",
+                            command_count,
+                            assistant_path,
+                            stream_result.chunk_count,
+                        )
+                    else:
+                        logger.warning(
+                            "wake_assistant_audio_skipped turn=%d reason=%s",
+                            command_count,
+                            "no compatible streaming chunks",
+                        )
+                interruption = (
+                    interrupt_monitor.result if interrupt_monitor is not None else None
+                )
+                if stream_result.interrupted and interruption is not None:
+                    logger.info(
+                        (
+                            "wake_playback_interrupted turn=%d latency_ms=%.1f "
+                            "transcript=%r kind=%s command=%r"
+                        ),
+                        command_count,
+                        stream_result.playback_ms,
+                        interruption.transcript,
+                        interruption.event.kind,
+                        interruption.event.command,
+                    )
+                    ui.user_text(interruption.transcript)
+                    ui.status("interrupted", interruption.transcript)
+                    ui.line(f"interrupted by wake: {interruption.transcript}")
+                    queued_command = _queued_interruption_command(interruption)
+                elif speaker is not None:
+                    logger.info(
+                        "wake_stream_played turn=%d latency_ms=%.1f chunks=%d",
+                        command_count,
+                        playback_ms,
+                        stream_result.chunk_count,
+                    )
+            else:
+                ui.status("contacting openai", config.openai.model)
+                openai_started = perf_counter()
+                llm_response = responder.generate(command)
+                openai_wall_ms = (perf_counter() - openai_started) * 1000.0
+                spoken_response = parse_spoken_markdown(llm_response.text)
+                ui.assistant_text(spoken_response.display_text)
+                code_block = spoken_response.primary_code_block
+                if code_block is not None:
+                    ui.code_block(code_block.language, code_block.code)
+                    logger.info(
+                        "wake_response_code_block turn=%d language=%s chars=%d",
+                        command_count,
+                        code_block.language,
+                        len(code_block.code),
+                    )
+                else:
+                    ui.clear_code_block()
+                ui.line(f"openai: {spoken_response.display_text}")
+                logger.info(
+                    (
+                        "wake_openai turn=%d wall_ms=%.1f latency_ms=%.1f model=%s "
+                        "response_id=%s chars=%d speech_chars=%d code_blocks=%d text=%r"
+                    ),
+                    command_count,
+                    openai_wall_ms,
+                    llm_response.latency_ms,
+                    llm_response.model,
+                    llm_response.response_id,
+                    len(llm_response.text),
+                    len(spoken_response.speech_text),
+                    len(spoken_response.code_blocks),
+                    llm_response.text,
+                )
+                if not use_tui:
+                    print(f"Assistant: {spoken_response.display_text}")
+
+                ui.status("running tts", "Kokoro voice")
+                tts_started = perf_counter()
+                speech = tts_model.synthesize(spoken_response.speech_text)
+                tts_wall_ms = (perf_counter() - tts_started) * 1000.0
+                tts_model_ms = speech.latency_ms
+                logger.info(
+                    "wake_tts turn=%d wall_ms=%.1f latency_ms=%.1f provider=%s sample_rate=%d",
+                    command_count,
+                    tts_wall_ms,
+                    speech.latency_ms,
+                    speech.provider,
+                    speech.speech.sample_rate,
+                )
+                if save_audio:
+                    assistant_path = audio_dir / f"turn-{command_count:03d}-assistant.wav"
+                    save_audio_buffer(speech.speech, assistant_path)
+                    logger.info(
+                        "wake_assistant_audio turn=%d path=%s",
+                        command_count,
+                        assistant_path,
+                    )
+                if speaker is not None:
+                    ui.status(
+                        "playing speech",
+                        f"{speech.speech.duration_ms} ms - say {config.wake.phrases[0]} to interrupt",
+                    )
+                    interrupt_monitor = PlaybackWakeMonitor(
+                        config=config,
+                        chunks=chunks,
+                        stt_model=stt_model,
+                        min_speech_ms=min_speech_ms,
+                        vad_threshold=active_vad_threshold,
+                        logger=logger,
+                        status_callback=ui.status,
+                    )
+                    interrupt_monitor.start()
+                    playback_started = perf_counter()
+                    try:
+                        playback_result = speaker.play_interruptible(
+                            speech.speech,
+                            interrupt_event=interrupt_monitor.interrupt_event,
+                        )
+                        playback_ms = (perf_counter() - playback_started) * 1000.0
+                    finally:
+                        interrupt_monitor.stop()
+                    interruption = interrupt_monitor.result
+                    if playback_result.interrupted and interruption is not None:
+                        logger.info(
+                            (
+                                "wake_playback_interrupted turn=%d latency_ms=%.1f "
+                                "transcript=%r kind=%s command=%r"
+                            ),
+                            command_count,
+                            playback_result.elapsed_ms,
+                            interruption.transcript,
+                            interruption.event.kind,
+                            interruption.event.command,
+                        )
+                        ui.user_text(interruption.transcript)
+                        ui.status("interrupted", interruption.transcript)
+                        ui.line(f"interrupted by wake: {interruption.transcript}")
+                        queued_command = _queued_interruption_command(interruption)
+                    else:
+                        logger.info(
+                            "wake_played turn=%d latency_ms=%.1f",
+                            command_count,
+                            playback_ms,
+                        )
+                else:
+                    playback_ms = 0.0
+
+            if queued_command is not None:
+                logger.info(
+                    "wake_barge_in_command_queued turn=%d command=%r transcript=%r",
+                    command_count,
+                    queued_command.command,
+                    queued_command.transcript,
+                )
+                ui.status("barge-in command", queued_command.command)
+                ui.line(f"barge-in queued: {queued_command.command}")
+
+            logger.info(
+                (
+                    "wake_turn_profile turn=%d utterance=%d source=%s total_ms=%.1f "
+                    "stt_wall_ms=%.1f stt_model_ms=%.1f openai_ms=%.1f "
+                    "tts_wall_ms=%.1f tts_model_ms=%.1f playback_ms=%.1f"
+                ),
+                command_count,
+                utterance_index,
+                source,
+                (perf_counter() - utterance_started) * 1000.0,
+                stt_wall_ms,
+                stt_latency_ms,
+                openai_wall_ms,
+                tts_wall_ms,
+                tts_model_ms,
+                playback_ms,
+            )
+            return CommandTurnResult(queued_command=queued_command)
+
         for utterance in utterances:
             utterance_count += 1
             utterance_started = perf_counter()
@@ -745,143 +1127,46 @@ def run_wake_loop(
                 continue
 
             assert event.command is not None
-            command = event.command.strip()
-            command_count += 1
-            ui.user_text(command)
-            ui.status("wake detected", f"command {command_count}")
-            logger.info(
-                "wake_command turn=%d utterance=%d command=%r",
-                command_count,
-                utterance_count,
-                command,
+            result = run_command_turn(
+                event.command,
+                utterance_index=utterance_count,
+                source="wake_loop",
+                source_transcript=text,
+                utterance_started=utterance_started,
+                stt_wall_ms=stt_wall_ms,
+                stt_latency_ms=transcript.latency_ms,
             )
-            if not use_tui:
-                print(f"You: {command}")
-            if command.lower() in {"q", "quit", "exit", "stop"}:
-                logger.info("wake_command_quit turn=%d", command_count)
+            if result.stop_requested:
                 break
 
-            ui.status("contacting openai", config.openai.model)
-            openai_started = perf_counter()
-            llm_response = responder.generate(command)
-            openai_wall_ms = (perf_counter() - openai_started) * 1000.0
-            spoken_response = parse_spoken_markdown(llm_response.text)
-            ui.assistant_text(spoken_response.display_text)
-            code_block = spoken_response.primary_code_block
-            if code_block is not None:
-                ui.code_block(code_block.language, code_block.code)
+            while result.queued_command is not None:
+                queued = result.queued_command
+                if max_commands and command_count >= max_commands:
+                    logger.info("wake_max_commands_reached turns=%d", command_count)
+                    break
                 logger.info(
-                    "wake_response_code_block turn=%d language=%s chars=%d",
+                    (
+                        "wake_barge_in_command_start previous_turn=%d "
+                        "command=%r transcript=%r"
+                    ),
                     command_count,
-                    code_block.language,
-                    len(code_block.code),
+                    queued.command,
+                    queued.transcript,
                 )
-            else:
-                ui.clear_code_block()
-            ui.line(f"openai: {spoken_response.display_text}")
-            logger.info(
-                (
-                    "wake_openai turn=%d wall_ms=%.1f latency_ms=%.1f model=%s "
-                    "response_id=%s chars=%d speech_chars=%d code_blocks=%d text=%r"
-                ),
-                command_count,
-                openai_wall_ms,
-                llm_response.latency_ms,
-                llm_response.model,
-                llm_response.response_id,
-                len(llm_response.text),
-                len(spoken_response.speech_text),
-                len(spoken_response.code_blocks),
-                llm_response.text,
-            )
-            if not use_tui:
-                print(f"Assistant: {spoken_response.display_text}")
-
-            ui.status("running tts", "Kokoro voice")
-            tts_started = perf_counter()
-            speech = tts_model.synthesize(spoken_response.speech_text)
-            tts_wall_ms = (perf_counter() - tts_started) * 1000.0
-            logger.info(
-                "wake_tts turn=%d wall_ms=%.1f latency_ms=%.1f provider=%s sample_rate=%d",
-                command_count,
-                tts_wall_ms,
-                speech.latency_ms,
-                speech.provider,
-                speech.speech.sample_rate,
-            )
-            if save_audio:
-                assistant_path = audio_dir / f"turn-{command_count:03d}-assistant.wav"
-                save_audio_buffer(speech.speech, assistant_path)
-                logger.info(
-                    "wake_assistant_audio turn=%d path=%s",
-                    command_count,
-                    assistant_path,
+                ui.status("running barge-in", queued.command)
+                result = run_command_turn(
+                    queued.command,
+                    utterance_index=utterance_count,
+                    source="playback_interruption",
+                    source_transcript=queued.transcript,
+                    utterance_started=perf_counter(),
+                    stt_wall_ms=queued.stt_wall_ms,
+                    stt_latency_ms=queued.stt_latency_ms,
                 )
-            if speaker is not None:
-                ui.status(
-                    "playing speech",
-                    f"{speech.speech.duration_ms} ms - say {config.wake.phrases[0]} to interrupt",
-                )
-                interrupt_monitor = PlaybackWakeMonitor(
-                    config=config,
-                    chunks=chunks,
-                    stt_model=stt_model,
-                    min_speech_ms=min_speech_ms,
-                    vad_threshold=active_vad_threshold,
-                    logger=logger,
-                    status_callback=ui.status,
-                )
-                interrupt_monitor.start()
-                playback_started = perf_counter()
-                try:
-                    playback_result = speaker.play_interruptible(
-                        speech.speech,
-                        interrupt_event=interrupt_monitor.interrupt_event,
-                    )
-                    playback_ms = (perf_counter() - playback_started) * 1000.0
-                finally:
-                    interrupt_monitor.stop()
-                interruption = interrupt_monitor.result
-                if playback_result.interrupted and interruption is not None:
-                    logger.info(
-                        (
-                            "wake_playback_interrupted turn=%d latency_ms=%.1f "
-                            "transcript=%r kind=%s command=%r"
-                        ),
-                        command_count,
-                        playback_result.elapsed_ms,
-                        interruption.transcript,
-                        interruption.event.kind,
-                        interruption.event.command,
-                    )
-                    ui.user_text(interruption.transcript)
-                    ui.status("interrupted", interruption.transcript)
-                    ui.line(f"interrupted by wake: {interruption.transcript}")
-                else:
-                    logger.info(
-                        "wake_played turn=%d latency_ms=%.1f",
-                        command_count,
-                        playback_ms,
-                    )
-            else:
-                playback_ms = 0.0
-
-            logger.info(
-                (
-                    "wake_turn_profile turn=%d utterance=%d total_ms=%.1f "
-                    "stt_wall_ms=%.1f stt_model_ms=%.1f openai_ms=%.1f "
-                    "tts_wall_ms=%.1f tts_model_ms=%.1f playback_ms=%.1f"
-                ),
-                command_count,
-                utterance_count,
-                (perf_counter() - utterance_started) * 1000.0,
-                stt_wall_ms,
-                transcript.latency_ms,
-                openai_wall_ms,
-                tts_wall_ms,
-                speech.latency_ms,
-                playback_ms,
-            )
+                if result.stop_requested:
+                    break
+            if result.stop_requested:
+                break
             if max_commands and command_count >= max_commands:
                 logger.info("wake_max_commands_reached turns=%d", command_count)
                 break

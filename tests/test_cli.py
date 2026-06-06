@@ -12,6 +12,7 @@ import numpy as np
 from whispertome.audio.types import AudioBuffer
 from whispertome.cli import (
     FallbackTextToSpeechModel,
+    _queued_interruption_command,
     apply_cli_overrides,
     build_parser,
     prepare_stt_model,
@@ -123,6 +124,7 @@ class CliTests(unittest.TestCase):
                 "--tui",
                 "--tui-lines",
                 "6",
+                "--no-stream-tts",
             ]
         )
 
@@ -133,6 +135,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.speech_end_ms, 1200)
         self.assertTrue(args.tui)
         self.assertEqual(args.tui_lines, 6)
+        self.assertTrue(args.no_stream_tts)
         self.assertFalse(args.no_warmup)
 
     def test_cli_can_override_speech_end_ms(self) -> None:
@@ -175,6 +178,22 @@ class CliTests(unittest.TestCase):
                     use_tui=False,
                     tui_lines=11,
                 )
+
+    def test_extracts_command_from_playback_interruption(self) -> None:
+        interruption = SimpleNamespace(
+            transcript="Computer, I don't care.",
+            wall_ms=300.0,
+            stt_latency_ms=250.0,
+            event=SimpleNamespace(kind="command_ready", command="I don't care."),
+        )
+
+        queued = _queued_interruption_command(interruption)
+
+        assert queued is not None
+        self.assertEqual(queued.command, "I don't care.")
+        self.assertEqual(queued.transcript, "Computer, I don't care.")
+        self.assertEqual(queued.stt_wall_ms, 300.0)
+        self.assertEqual(queued.stt_latency_ms, 250.0)
 
     def test_allow_non_npu_keeps_qai_whisper_on_npu(self) -> None:
         config = SimpleNamespace(stt=SimpleNamespace(backend="qai_whisper"))

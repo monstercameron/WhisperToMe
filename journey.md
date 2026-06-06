@@ -260,17 +260,18 @@ Commit: `7e3e19f` (`Milestone: initial voice assistant scaffold`)
 - Added TUI states for interruption STT and interruption detected.
 - Logged playback-time transcripts and `wake_playback_interrupted` events for debugging false positives and missed interruptions.
 - Added tests for interruptible speaker stop behavior and wake detection during playback.
+- Follow-up: when playback-time STT produces a `command_ready` event, the command is now queued and immediately executed as the next OpenAI turn.
 
 ### Losses
 
-- Interruption currently stops playback and returns to listening; it does not yet automatically execute a command spoken after the wake phrase during the interruption.
+- The first interruption implementation stopped playback and returned to listening even when STT had already parsed a command such as `Computer, I don't care.`
 - Echo from speakers may be captured by the microphone, so interruption wake phrases should be chosen carefully and tested with real speaker volume.
 - Playback-time wake detection still waits for a VAD-delimited utterance before STT can confirm the wake phrase.
 
 ### Decisions
 
 - Use the existing microphone iterator during playback rather than opening a second input stream, because some audio devices reject parallel input streams.
-- Treat barge-in command execution as the next step after reliable wake-to-stop interruption is verified.
+- Treat `wake_detected` interruptions as stop-only, but treat `command_ready` interruptions as immediate barge-in commands.
 
 ## Milestone 11: Markdown-Aware TTS and Script Display
 
@@ -297,3 +298,26 @@ Commit: `7e3e19f` (`Milestone: initial voice assistant scaffold`)
 - Keep raw OpenAI text in logs, but send only spoken-safe text to TTS.
 - Keep prose in the assistant output panel and move code/script contents to the dedicated TUI viewport.
 - Prefer one larger, copyable block over several smaller blocks unless the user asks for multiple files or examples.
+
+## Milestone 12: Streaming Tokens to Streaming TTS
+
+### Wins
+
+- Added a streaming Responses API path that consumes `response.output_text.delta` events while preserving stateful `previous_response_id` behavior.
+- Added a markdown-aware spoken chunker that emits sentence-complete text outside fenced code blocks.
+- Added a queued streaming speech player with separate TTS and playback workers so later chunks can synthesize while earlier audio is playing.
+- Made the wake loop use streaming TTS by default and added `--no-stream-tts` for the older batch path.
+- Kept final markdown parsing for the TUI code viewport, so streamed speech and final display stay aligned.
+- Logged first text, first audio, first playback, chunk count, synthesis time, and playback time for profiling.
+
+### Losses
+
+- Kokoro is still a batch TTS model, so streaming means chunked synthesis rather than true acoustic-frame streaming.
+- Code-heavy replies may still wait until the final parse before speaking the placeholder, because the chunker avoids reading ambiguous pre-code lead-ins too early.
+- The streaming path is implemented for the live wake loop first; the older `demo` command still uses batch OpenAI/TTS.
+
+### Decisions
+
+- Stream only sentence-complete spoken chunks to avoid choppy TTS and mid-sentence prosody problems.
+- Keep `--no-stream-tts` as a practical fallback while tuning chunking, interruption, and audio device behavior.
+- Continue using the local TTS model for audio; OpenAI streaming is only for text deltas.

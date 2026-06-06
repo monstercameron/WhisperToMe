@@ -13,7 +13,30 @@ class FakeResponses:
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
+        if kwargs.get("stream"):
+            return FakeStream(
+                [
+                    SimpleNamespace(type="response.output_text.delta", delta="Hel"),
+                    SimpleNamespace(type="response.output_text.delta", delta="lo."),
+                    SimpleNamespace(
+                        type="response.completed",
+                        response=SimpleNamespace(id=f"resp_{len(self.calls)}"),
+                    ),
+                ]
+            )
         return SimpleNamespace(id=f"resp_{len(self.calls)}", output_text="Done.")
+
+
+class FakeStream:
+    def __init__(self, events) -> None:
+        self._events = events
+        self.closed = False
+
+    def __iter__(self):
+        return iter(self._events)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeClient:
@@ -77,6 +100,44 @@ class OpenAIResponderTests(unittest.TestCase):
 
         self.assertFalse(client.responses.calls[0]["store"])
         self.assertNotIn("previous_response_id", client.responses.calls[1])
+
+    def test_streaming_responder_emits_deltas_and_returns_final_response(self) -> None:
+        client = FakeClient()
+        config = OpenAIConfig(
+            api_key="test",
+            model="gpt-test",
+            system_prompt="System prompt",
+            max_output_tokens=None,
+            stateful=True,
+        )
+        deltas: list[str] = []
+
+        response = OpenAIResponder(config, client=client).generate_stream(
+            "hello",
+            on_delta=deltas.append,
+        )
+
+        self.assertEqual(deltas, ["Hel", "lo."])
+        self.assertEqual(response.text, "Hello.")
+        self.assertEqual(response.response_id, "resp_1")
+        self.assertTrue(client.responses.calls[0]["stream"])
+
+    def test_streaming_responder_sends_previous_response_id(self) -> None:
+        client = FakeClient()
+        config = OpenAIConfig(
+            api_key="test",
+            model="gpt-test",
+            system_prompt="System prompt",
+            max_output_tokens=None,
+            stateful=True,
+        )
+        responder = OpenAIResponder(config, client=client)
+
+        responder.generate_stream("first", on_delta=lambda _delta: None)
+        responder.generate_stream("second", on_delta=lambda _delta: None)
+
+        self.assertNotIn("previous_response_id", client.responses.calls[0])
+        self.assertEqual(client.responses.calls[1]["previous_response_id"], "resp_1")
 
 
 if __name__ == "__main__":
