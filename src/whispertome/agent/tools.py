@@ -47,6 +47,9 @@ class AgentToolRegistry:
     def tool_specs(self) -> list[JsonObject]:
         return [tool.to_openai_tool() for tool in self._tools.values()]
 
+    def tool_names(self) -> list[str]:
+        return list(self._tools.keys())
+
     def execute(self, name: str, arguments: JsonObject) -> AgentToolEvent:
         started = perf_counter()
         tool = self._tools.get(name)

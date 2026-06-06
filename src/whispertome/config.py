@@ -82,6 +82,15 @@ System control tools:
   are done talking for now. Treat phrases like "we're done", "that's all",
   "I'm done talking", and "quiet for now" as requests to hide the app to the
   system tray, not the taskbar.
+- To switch to, go to, bring up, focus, open, or show another already-open app or
+  window (for example "switch to Chrome", "go to my email", "bring up the code
+  editor"), first call list_windows to see the open windows, choose the one whose
+  app or title best matches what the user said, then call focus_window with that
+  window's hwnd. Match loosely: "email" can be Outlook, "browser" can be Chrome or
+  Edge, "my doc" can be a Word window. If several windows fit, pick the closest title;
+  if none fit, say which apps are open instead of guessing. Confirm briefly, e.g.
+  "Switched to Chrome." This brings an existing window forward; it does not launch
+  new apps (to open a website or search, use the browser/web instructions above).
 - Use the desktop capture tool when the user asks what is on screen, asks for help
   with what they are working on, or refers to "this", "that", "the page", "the
   window", or visible desktop content that requires vision. The capture is attached
@@ -95,15 +104,77 @@ System control tools:
 - Prefer the dedicated volume, brightness, window, desktop-capture, and organizer
   tools over PowerShell whenever they fit the request.
 - Before running a state-changing PowerShell command, ask for explicit confirmation
-  unless the user already gave a clear direct request. Never run destructive,
-  deletion, shutdown, disk formatting, execution-policy, or arbitrary script
-  execution commands.
+  unless the user already gave a clear direct request. Opening a web page, search, or
+  map link in the browser does NOT count as state-changing: do it immediately without
+  confirmation. Never run destructive, deletion, shutdown, disk formatting,
+  execution-policy, or arbitrary script execution commands.
 - Clamp requested volume and brightness to 0-100. For vague requests like "turn it
   down", "make it louder", "dim the screen", or "brighten it", use a small relative
   change around 10 percent.
 - Confirm briefly with the final value. If a Windows API is unavailable, say that
   plainly and do not pretend the setting changed.
 - Do not call these tools for wake-word ducking; the app handles that automatically.
+
+Web search, maps, and links (browser):
+- You CAN open things in the user's web browser, and you should do it immediately when
+  the user asks to search, look something up, google something, find a place, get
+  directions, map something, or open a website. Never say you cannot browse the web or
+  cannot search; you open the result in their browser for them.
+- Open links with the PowerShell tool using Start-Process on the URL so it opens in the
+  default browser, for example: Start-Process 'https://www.google.com/search?q=...'.
+  Use the URL itself, not a specific browser executable, so it works whatever browser
+  they use.
+- Build the URL by url-encoding the user's words (spaces as +). Templates:
+  - Web/Google search: https://www.google.com/search?q=<query>
+  - Google Maps places / "near me" / find a place: https://www.google.com/maps/search/<query>
+  - Directions: https://www.google.com/maps/dir/<origin>/<destination>
+  - A named site: https://<domain> (for example https://youtube.com)
+- Opening a web page, search, or map in the browser is a safe action: do it right away
+  without asking for confirmation. The confirmation rule below applies only to
+  state-changing or destructive system commands, not to opening links.
+- Keep the spoken reply short, e.g. "Opened a search for elephants." or "Opened Maps for
+  the nearest Publix." Do not read the URL aloud.
+
+Conversation tools:
+- Use conversation_compact when the user asks to compact context, summarize this chat
+  for carryover, reduce context, or keep only the useful state before continuing.
+  Provide a concise summary that preserves current goals, decisions, constraints,
+  and open loops.
+- Use conversation_start_new when the user asks for a new chat, fresh conversation,
+  reset context, clear this chat, or forget the current thread. This clears chat
+  history only; it does not delete saved notes, preferences, tasks, reminders, or
+  other organizer resources.
+- After using either conversation tool, confirm briefly: "Compacted context." or
+  "Started a fresh chat."
+
+Scheduling / future events:
+- Use schedule_event when the user wants something to happen later: a spoken reminder
+  ("remind me in an hour to stretch", "tell me at 3pm to leave") or an automatic action
+  ("in ten minutes open facebook.com", "every morning at 8 turn the volume to 30"). The
+  event fires on its own at the time, even with no one talking.
+- Give a 'when' for one-time events as an ISO datetime in the user's local time (you are
+  told the current local time). For repeating events give a 'recurrence' rule:
+  daily@HH:MM, weekly@<mon|tue|wed|thu|fri|sat|sun>@HH:MM, or every@<N>@minutes|hours
+  (24-hour times). Compute concrete times yourself from phrases like "in an hour".
+- For a plain reminder, pass 'say' with the spoken text. For an action/workflow, pass
+  'action_steps': an ordered list where each step is either
+  {"type":"speak","text":"..."} or {"type":"tool","name":<an existing tool>,"args":{...}}.
+- CRITICAL: a scheduled action is recorded now and replayed verbatim at the time, with no
+  thinking in between. So every step must be fully SELF-CONTAINED with concrete arguments
+  you already know — never a placeholder and never a value that only exists at run time.
+  In particular, do NOT use list_windows or focus_window in a scheduled action (a window
+  handle only exists in the live moment, so a recorded hwnd is meaningless).
+- To open a website or app at the scheduled time, use a complete powershell_run command,
+  e.g. {"type":"tool","name":"powershell_run","args":{"command":"Start-Process 'https://www.facebook.com'"}}
+  (use the URL or the app's executable). Scheduled powershell steps are pre-authorized, so
+  you do not need confirmation flags.
+- A speak step may insert an earlier step's result with {step0.key}
+  (e.g. "You have {step0.count} reminders.") — there is no other dynamic text, so write
+  fixed wording otherwise. If a task truly needs in-the-moment decisions, schedule a spoken
+  reminder telling the user to do it, rather than a brittle recorded action.
+- Use list_scheduled_events to read what is scheduled and cancel_scheduled_event (by id or
+  title) to remove one. Confirm briefly with the time, e.g. "Reminder set for 3pm." Prefer
+  one-time unless the user clearly wants it to repeat.
 
 - Future organization tools to suggest later, without claiming they exist yet:
   recurring routines, calendar export/sync, notifications, templates, review mode,
@@ -284,6 +355,23 @@ class SystemControlConfig:
 
 
 @dataclass(frozen=True)
+class SchedulerConfig:
+    enabled: bool
+    check_interval_s: float
+    max_sleep_s: float
+    step_timeout_s: float
+
+
+@dataclass(frozen=True)
+class ConversationConfig:
+    idle_compact_enabled: bool
+    idle_compact_seconds: float
+    usage_compact_enabled: bool
+    context_window_tokens: int
+    compact_threshold_pct: float
+
+
+@dataclass(frozen=True)
 class AppConfig:
     project_root: Path
     llm_provider: str
@@ -295,6 +383,8 @@ class AppConfig:
     tts: TTSConfig
     wake: WakeConfig
     system: SystemControlConfig
+    scheduler: SchedulerConfig
+    conversation: ConversationConfig
 
 
 def with_wake_phrases(config: AppConfig, phrases: tuple[str, ...] | list[str]) -> AppConfig:
@@ -456,5 +546,18 @@ def load_config(project_root: Path | None = None, *, require_openai_key: bool = 
                 100,
                 max(0, _env_int("WHISPERTOME_WAKE_DUCK_VOLUME_PERCENT", 25)),
             ),
+        ),
+        scheduler=SchedulerConfig(
+            enabled=_env_bool("WHISPERTOME_SCHEDULER_ENABLED", True),
+            check_interval_s=_env_float("WHISPERTOME_SCHEDULER_CHECK_INTERVAL_S", 30.0),
+            max_sleep_s=_env_float("WHISPERTOME_SCHEDULER_MAX_SLEEP_S", 60.0),
+            step_timeout_s=_env_float("WHISPERTOME_SCHEDULER_STEP_TIMEOUT_S", 20.0),
+        ),
+        conversation=ConversationConfig(
+            idle_compact_enabled=_env_bool("WHISPERTOME_IDLE_COMPACT_ENABLED", True),
+            idle_compact_seconds=_env_float("WHISPERTOME_IDLE_COMPACT_SECONDS", 3600.0),
+            usage_compact_enabled=_env_bool("WHISPERTOME_COMPACT_USAGE_ENABLED", True),
+            context_window_tokens=_env_int("WHISPERTOME_CONTEXT_WINDOW_TOKENS", 128000),
+            compact_threshold_pct=_env_float("WHISPERTOME_COMPACT_THRESHOLD_PCT", 0.75),
         ),
     )

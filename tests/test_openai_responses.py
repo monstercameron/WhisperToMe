@@ -11,6 +11,10 @@ from whispertome.agent.tools import (
     string_schema,
 )
 from whispertome.config import OpenAIConfig
+from whispertome.llm.conversation_tools import (
+    ConversationController,
+    build_conversation_tools,
+)
 from whispertome.llm.openai_responses import OpenAIResponder
 
 
@@ -153,6 +157,27 @@ class PreferenceToolLoopResponses:
         return SimpleNamespace(id="resp_final", output_text="Saved preference: call you Marcus.")
 
 
+class NewChatToolLoopResponses:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            return SimpleNamespace(
+                id="resp_tool",
+                output=[
+                    SimpleNamespace(
+                        type="function_call",
+                        name="conversation_start_new",
+                        arguments='{"reason":"user asked"}',
+                        call_id="call_new_chat",
+                    )
+                ],
+            )
+        return SimpleNamespace(id=f"resp_{len(self.calls)}", output_text="Started fresh.")
+
+
 class ToolLoopClient:
     def __init__(self, responses) -> None:
         self.responses = responses
@@ -219,6 +244,12 @@ def preference_registry(context: list[str]) -> AgentToolRegistry:
             )
         ]
     )
+
+
+def conversation_registry(
+    controller: ConversationController,
+) -> AgentToolRegistry:
+    return AgentToolRegistry(build_conversation_tools(controller))
 
 
 class OpenAIResponderTests(unittest.TestCase):
@@ -298,6 +329,47 @@ class OpenAIResponderTests(unittest.TestCase):
 
         self.assertFalse(client.responses.calls[0]["store"])
         self.assertNotIn("previous_response_id", client.responses.calls[1])
+
+    def test_reset_conversation_starts_fresh_chain(self) -> None:
+        client = FakeClient()
+        config = OpenAIConfig(
+            api_key="test",
+            model="gpt-test",
+            system_prompt="System prompt",
+            max_output_tokens=None,
+            stateful=True,
+        )
+        responder = OpenAIResponder(config, client=client)
+
+        responder.generate("first")
+        responder.reset_conversation()
+        responder.generate("second")
+        responder.generate("third")
+
+        self.assertNotIn("previous_response_id", client.responses.calls[1])
+        self.assertEqual(client.responses.calls[2]["previous_response_id"], "resp_2")
+
+    def test_compact_conversation_injects_summary_and_starts_fresh_chain(self) -> None:
+        client = FakeClient()
+        config = OpenAIConfig(
+            api_key="test",
+            model="gpt-test",
+            system_prompt="System prompt",
+            max_output_tokens=None,
+            stateful=True,
+        )
+        responder = OpenAIResponder(config, client=client)
+
+        responder.generate("first")
+        responder.compact_conversation("User is polishing the desktop TUI.")
+        responder.generate("second")
+        responder.generate("third")
+
+        second_call = client.responses.calls[1]
+        self.assertNotIn("previous_response_id", second_call)
+        self.assertIn("Compacted conversation context", second_call["instructions"])
+        self.assertIn("desktop TUI", second_call["instructions"])
+        self.assertEqual(client.responses.calls[2]["previous_response_id"], "resp_2")
 
     def test_streaming_responder_emits_deltas_and_returns_final_response(self) -> None:
         client = FakeClient()
@@ -450,6 +522,29 @@ class OpenAIResponderTests(unittest.TestCase):
         self.assertEqual(response.response_id, "resp_final")
         self.assertEqual(responses.calls[1]["previous_response_id"], "resp_tool")
         self.assertEqual(events[0].output["saved"], "call Sam")
+
+    def test_new_chat_tool_resets_next_response_chain(self) -> None:
+        responses = NewChatToolLoopResponses()
+        controller = ConversationController()
+        config = OpenAIConfig(
+            api_key="test",
+            model="gpt-test",
+            system_prompt="System prompt",
+            max_output_tokens=None,
+            stateful=True,
+        )
+        responder = OpenAIResponder(
+            config,
+            client=ToolLoopClient(responses),
+            tool_registry=conversation_registry(controller),
+        )
+        controller.bind(responder)
+
+        responder.generate("start a new chat")
+        responder.generate("next topic")
+
+        self.assertEqual(responses.calls[1]["previous_response_id"], "resp_tool")
+        self.assertNotIn("previous_response_id", responses.calls[2])
 
 
 if __name__ == "__main__":

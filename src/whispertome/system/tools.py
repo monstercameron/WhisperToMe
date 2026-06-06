@@ -25,6 +25,8 @@ from whispertome.system.windows import (
     WindowsDesktopCaptureController,
     WindowsPowerShellController,
     WindowsVolumeController,
+    WindowsWindowSwitcher,
+    WindowSwitcher,
     clamp_percent,
 )
 
@@ -37,12 +39,14 @@ def build_system_control_tools(
     window_controller: AgentWindowController | None = None,
     capture_controller: DesktopCaptureController | None = None,
     powershell_controller: PowerShellController | None = None,
+    window_switcher: WindowSwitcher | None = None,
 ) -> list[AgentTool]:
     volume = volume_controller or WindowsVolumeController()
     brightness = brightness_controller or WindowsBrightnessController()
     window = window_controller or WindowsAgentWindowController()
     capture = capture_controller or WindowsDesktopCaptureController(project_root=project_root)
     powershell = powershell_controller or WindowsPowerShellController()
+    switcher = window_switcher or WindowsWindowSwitcher()
     return [
         _system_volume_get(volume),
         _system_volume_set(volume),
@@ -52,6 +56,8 @@ def build_system_control_tools(
         _screen_brightness_set(brightness),
         _screen_brightness_change(brightness),
         _agent_window_minimize(window),
+        _list_windows(switcher),
+        _focus_window(switcher),
         _desktop_capture(capture),
         _powershell_run(powershell),
     ]
@@ -188,6 +194,50 @@ def _agent_window_minimize(controller: AgentWindowController) -> AgentTool:
         ),
         parameters=object_schema({}),
         handler=lambda _args: _window_action_result(controller.minimize_agent_window()),
+    )
+
+
+def _list_windows(switcher: WindowSwitcher) -> AgentTool:
+    def handler(_args: dict) -> dict:
+        windows = switcher.list_windows()
+        return {
+            "ok": True,
+            "windows": [
+                {"hwnd": w.hwnd, "app": w.app, "title": w.title} for w in windows
+            ],
+        }
+
+    return AgentTool(
+        name="list_windows",
+        description=(
+            "List the currently open application windows (their app name and title). Call "
+            "this when the user asks to switch to, go to, bring up, focus, or show another "
+            "app or window. Then pick the window whose app/title best matches what the user "
+            "said and call focus_window with its hwnd. If nothing matches, tell the user."
+        ),
+        parameters=object_schema({}),
+        handler=handler,
+    )
+
+
+def _focus_window(switcher: WindowSwitcher) -> AgentTool:
+    def handler(args: dict) -> dict:
+        hwnd = args.get("hwnd")
+        if not isinstance(hwnd, int):
+            return {"ok": False, "error": "hwnd (integer from list_windows) is required"}
+        return _window_action_result(switcher.focus_window(hwnd))
+
+    return AgentTool(
+        name="focus_window",
+        description=(
+            "Bring a specific open window to the foreground (switch to it). Use the hwnd "
+            "from a list_windows result for the window that best matches the user's request."
+        ),
+        parameters=object_schema(
+            {"hwnd": integer_schema("The window handle (hwnd) from list_windows.")},
+            required=["hwnd"],
+        ),
+        handler=handler,
     )
 
 

@@ -11,6 +11,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from time import perf_counter
+from time import time as wall_time
 from typing import TextIO
 
 RESET = "\x1b[0m"
@@ -24,6 +25,8 @@ BLUE = "\x1b[34m"
 WHITE = "\x1b[37m"
 TUI_WIDTH_ENV = "WHISPERTOME_TUI_WIDTH"
 TUI_HEIGHT_ENV = "WHISPERTOME_TUI_HEIGHT"
+TUI_FPS_ENV = "WHISPERTOME_TUI_FPS"
+TUI_IDLE_FPS_ENV = "WHISPERTOME_TUI_IDLE_FPS"
 LOGGER = logging.getLogger(__name__)
 DISPLAY_TRANSLATION = str.maketrans(
     {
@@ -87,6 +90,9 @@ class NullVoiceUi:
     def activity(self, value: float) -> None:
         return
 
+    def next_event(self, title: str | None, epoch: float | None) -> None:
+        return
+
 
 @dataclass
 class TerminalUiState:
@@ -102,6 +108,8 @@ class TerminalUiState:
     boot_phase: str = "initializing"
     boot_detail: str = ""
     boot_progress: float = 0.0
+    next_event_title: str = ""
+    next_event_epoch: float | None = None
     stream_lines: deque[str] = field(default_factory=deque)
 
     def __post_init__(self) -> None:
@@ -148,6 +156,10 @@ class TerminalUiState:
     def set_activity(self, value: float) -> None:
         self.activity_value = max(0.0, min(1.0, float(value)))
 
+    def set_next_event(self, title: str | None, epoch: float | None) -> None:
+        self.next_event_title = display_text(title or "").strip()
+        self.next_event_epoch = epoch if self.next_event_title else None
+
     def add_line(self, text: str) -> None:
         line = " ".join(display_text(text).strip().split())
         if line:
@@ -167,6 +179,8 @@ class TerminalUiState:
             boot_phase=self.boot_phase,
             boot_detail=self.boot_detail,
             boot_progress=self.boot_progress,
+            next_event_title=self.next_event_title,
+            next_event_epoch=self.next_event_epoch,
             stream_lines=deque(self.stream_lines, maxlen=self.max_lines),
         )
 
@@ -176,12 +190,19 @@ class TerminalVoiceUi:
         self,
         *,
         stream: TextIO | None = None,
-        fps: float = 24.0,
+        fps: float | None = None,
+        idle_fps: float | None = None,
         max_lines: int = 10,
     ) -> None:
         self._stream = stream or sys.stdout
         _configure_stream_for_display(self._stream)
-        self._fps = max(4.0, fps)
+        # Reactions are event-driven (state changes wake the renderer instantly), so the
+        # frame rate only governs free-running animation smoothness. Low rates save real
+        # energy on a fanless device. Both are env-tunable.
+        active = fps if fps is not None else _env_float(TUI_FPS_ENV, 5.0)
+        idle = idle_fps if idle_fps is not None else _env_float(TUI_IDLE_FPS_ENV, 2.0)
+        self._fps = max(1.0, active)
+        self._idle_fps = max(0.5, min(idle, self._fps))
         self._state = TerminalUiState(max_lines=max_lines)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -253,18 +274,28 @@ class TerminalVoiceUi:
             self._state.set_activity(value)
         self._request_render()
 
+    def next_event(self, title: str | None, epoch: float | None) -> None:
+        with self._lock:
+            self._state.set_next_event(title, epoch)
+        self._request_render()
+
     def _request_render(self) -> None:
         self._render_event.set()
 
     def _render_loop(self) -> None:
-        interval = 1.0 / self._fps
+        full_interval = 1.0 / self._fps
+        idle_interval = 1.0 / self._idle_fps
+        interval = full_interval
         last_rendered = 0.0
         while not self._stop_event.is_set():
             timeout = max(0.0, interval - (perf_counter() - last_rendered))
             self._render_event.wait(timeout)
-            self._render_event.clear()
             if self._stop_event.is_set():
                 break
+            # Clear immediately before snapshotting: any state change (and its set()) that
+            # lands after this point survives to trigger the next iteration promptly, so a
+            # change is never delayed by the (now slower) idle interval.
+            self._render_event.clear()
             try:
                 with self._lock:
                     snapshot = self._state.copy()
@@ -272,6 +303,8 @@ class TerminalVoiceUi:
                 frame = render_frame(snapshot, width=width, height=height, frame=self._frame)
                 self._write_stream("\x1b[H\x1b[2J" + frame)
                 self._render_failures = 0
+                # Throttle the free-running animation when idle; active states keep full FPS.
+                interval = full_interval if _is_animation_active(snapshot) else idle_interval
             except Exception:
                 self._render_failures += 1
                 LOGGER.exception("terminal_tui_render_failed count=%d", self._render_failures)
@@ -305,6 +338,16 @@ def _env_int(name: str, default: int) -> int:
         return default
     try:
         return int(value)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
     except ValueError:
         return default
 
@@ -531,6 +574,25 @@ def render_boot_modules(progress: float, width: int) -> list[str]:
     return columns
 
 
+def format_next_event(state: TerminalUiState) -> str:
+    """Compact 'NEXT <title> in Xm' agenda chip; counts down live (computed per frame)."""
+    title = (state.next_event_title or "").strip()
+    if not title or state.next_event_epoch is None:
+        return ""
+    delta = state.next_event_epoch - wall_time()
+    if delta < 0:
+        rel = "now"
+    elif delta < 60:
+        rel = f"in {int(delta)}s"
+    elif delta < 3600:
+        rel = f"in {int(delta // 60)}m"
+    elif delta < 86400:
+        rel = f"in {int(delta // 3600)}h"
+    else:
+        rel = f"in {int(delta // 86400)}d"
+    return f"NEXT {fit_plain(title, 16)} {rel}"
+
+
 def render_runtime_header(state: TerminalUiState, width: int) -> list[str]:
     status = fit_plain(state.status_text.upper(), 22)
     clock = datetime.now().strftime("%H:%M:%S")
@@ -549,7 +611,12 @@ def render_runtime_header(state: TerminalUiState, width: int) -> list[str]:
             f"  |  {color_for_status(state.status_text)}{status}{RESET}"
         )
     if width >= 76:
-        content = pad_visible(content, width - 14) + f"{DIM}{clock}{RESET}"
+        agenda = format_next_event(state) if width >= 96 else ""
+        right_plain = f"{agenda}   {clock}" if agenda else clock
+        right_colored = (
+            f"{YELLOW}{agenda}{RESET}   {DIM}{clock}{RESET}" if agenda else f"{DIM}{clock}{RESET}"
+        )
+        content = pad_visible(content, max(0, width - len(right_plain) - 6)) + right_colored
     return [border_line(width, "-"), wrap_panel_line(content, width, CYAN), border_line(width, "-")]
 
 
@@ -1144,3 +1211,14 @@ def status_activity_boost(status: str) -> float:
     if "transcribing" in lowered or "speech captured" in lowered:
         return 0.55
     return 0.0
+
+
+def _is_animation_active(state: TerminalUiState) -> bool:
+    """Whether the scene needs full-rate animation. Idle scenes render slowly to save
+    energy; any of these conditions restores full FPS (and state changes always wake the
+    renderer immediately regardless)."""
+    return (
+        state.boot_active
+        or state.activity_value > 0.05
+        or status_activity_boost(state.status_text) > 0.0
+    )

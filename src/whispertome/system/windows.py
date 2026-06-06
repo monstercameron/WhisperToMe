@@ -46,6 +46,12 @@ class AgentWindowController(Protocol):
     def minimize_agent_window(self) -> WindowActionResult: ...
 
 
+class WindowSwitcher(Protocol):
+    def list_windows(self) -> list[WindowInfo]: ...
+
+    def focus_window(self, hwnd: int) -> WindowActionResult: ...
+
+
 class DesktopCaptureController(Protocol):
     def capture_desktop(
         self,
@@ -87,6 +93,14 @@ class WindowActionResult:
     window_title: str | None
     hwnd: int | None
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class WindowInfo:
+    hwnd: int
+    process_id: int | None
+    title: str
+    app: str | None  # process exe stem, e.g. "chrome", "msedge"
 
 
 @dataclass(frozen=True)
@@ -332,6 +346,62 @@ class WindowsAgentWindowController:
             process_id=self._target_pid,
             window_title=self._title,
             hwnd=None,
+        )
+
+
+class WindowsWindowSwitcher:
+    """Lists open top-level windows and focuses one by handle.
+
+    The model picks the window whose title/app best matches the user's request, then calls
+    focus_window(hwnd). Focusing uses the AttachThreadInput workaround for the Windows
+    foreground lock. The assistant's own window is excluded from the list.
+    """
+
+    def __init__(self, *, exclude_pid: int | None = None, exclude_title: str | None = None) -> None:
+        self._exclude_pid = exclude_pid if exclude_pid is not None else _env_pid()
+        self._exclude_title = exclude_title or os.environ.get(
+            DESKTOP_WINDOW_TITLE_ENV, DEFAULT_DESKTOP_WINDOW_TITLE
+        )
+
+    def list_windows(self) -> list[WindowInfo]:
+        if sys.platform != "win32":
+            return []
+        windows: list[WindowInfo] = []
+        seen: set[int] = set()
+        for hwnd, pid, title in _iter_visible_windows():
+            if not title.strip():
+                continue
+            if self._exclude_pid is not None and pid == self._exclude_pid:
+                continue
+            if self._exclude_title and title == self._exclude_title:
+                continue
+            if hwnd in seen:
+                continue
+            seen.add(hwnd)
+            app = _process_exe_stem(pid) if pid else None
+            windows.append(WindowInfo(hwnd=hwnd, process_id=pid, title=title, app=app))
+        return windows
+
+    def focus_window(self, hwnd: int) -> WindowActionResult:
+        if sys.platform != "win32":
+            return WindowActionResult(
+                False, None, None, hwnd, reason="Window switching is only available on Windows"
+            )
+        # Resolve title/pid for a useful result and to confirm the handle is still live.
+        info = next((w for w in self.list_windows() if w.hwnd == hwnd), None)
+        try:
+            focused = _focus_window(hwnd)
+        except Exception as exc:  # noqa: BLE001
+            return WindowActionResult(
+                False, info.process_id if info else None, info.title if info else None, hwnd,
+                reason=str(exc),
+            )
+        return WindowActionResult(
+            ok=focused,
+            process_id=info.process_id if info else None,
+            window_title=info.title if info else None,
+            hwnd=hwnd,
+            reason=None if focused else "Windows did not bring the window to the foreground",
         )
 
 
@@ -933,6 +1003,106 @@ def _find_top_level_window(
             if match[2] == title:
                 return match
     return matches[0]
+
+
+def _iter_visible_windows() -> list[tuple[int, int | None, str]]:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    found: list[tuple[int, int | None, str]] = []
+    proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @proc
+    def enum_window(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, length + 1)
+        process_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        found.append((int(hwnd), int(process_id.value) or None, buffer.value))
+        return True
+
+    user32.EnumWindows(enum_window, 0)
+    return found
+
+
+def _process_exe_stem(pid: int) -> str | None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+    ]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    process_query_limited_information = 0x1000
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return None
+    try:
+        size = wintypes.DWORD(260)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return None
+        return Path(buffer.value).stem.lower()
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _focus_window(hwnd: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.BringWindowToTop.argtypes = [wintypes.HWND]
+    user32.SetActiveWindow.argtypes = [wintypes.HWND]
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+    sw_restore = 9
+    target = wintypes.HWND(hwnd)
+    foreground = user32.GetForegroundWindow()
+    this_thread = kernel32.GetCurrentThreadId()
+    target_thread = user32.GetWindowThreadProcessId(target, None)
+    fore_thread = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+
+    # Attaching input queues lets SetForegroundWindow bypass the foreground lock.
+    attach_target = bool(target_thread) and target_thread != this_thread
+    attach_fore = bool(fore_thread) and fore_thread not in (this_thread, target_thread)
+    if attach_target:
+        user32.AttachThreadInput(this_thread, target_thread, True)
+    if attach_fore:
+        user32.AttachThreadInput(this_thread, fore_thread, True)
+    try:
+        if user32.IsIconic(target):
+            user32.ShowWindow(target, sw_restore)
+        user32.SetForegroundWindow(target)
+        user32.BringWindowToTop(target)
+        user32.SetActiveWindow(target)
+    finally:
+        if attach_target:
+            user32.AttachThreadInput(this_thread, target_thread, False)
+        if attach_fore:
+            user32.AttachThreadInput(this_thread, fore_thread, False)
+
+    now = user32.GetForegroundWindow()
+    return now is not None and int(now) == int(hwnd)
 
 
 def _max_capture_width(value: int) -> int:

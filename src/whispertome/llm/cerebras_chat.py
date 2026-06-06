@@ -44,6 +44,9 @@ class CerebrasResponder:
         self._system_context_provider = system_context_provider
         self._max_tool_iterations = max_tool_iterations
         self._history: list[ChatMessage] = []
+        self._conversation_summary: str | None = None
+        self._skip_current_turn_memory = False
+        self._executing_tool_call = False
 
     def generate(
         self,
@@ -137,6 +140,18 @@ class CerebrasResponder:
 
     def reset_conversation(self) -> None:
         self._history.clear()
+        self._conversation_summary = None
+        if self._executing_tool_call:
+            self._skip_current_turn_memory = True
+
+    def compact_conversation(self, summary: str) -> None:
+        stripped = " ".join(str(summary).strip().split())
+        if not stripped:
+            raise ValueError("summary cannot be empty")
+        self._history.clear()
+        self._conversation_summary = stripped
+        if self._executing_tool_call:
+            self._skip_current_turn_memory = True
 
     def _generate_with_tools(
         self,
@@ -198,7 +213,11 @@ class CerebrasResponder:
                     latency_ms=0.0,
                 )
             else:
-                event = self._tool_registry.execute(call.name, arguments)
+                self._executing_tool_call = True
+                try:
+                    event = self._tool_registry.execute(call.name, arguments)
+                finally:
+                    self._executing_tool_call = False
 
             public_output = _public_tool_output(event.output)
             public_event = (
@@ -241,15 +260,22 @@ class CerebrasResponder:
         return messages
 
     def _instructions(self) -> str:
+        parts = [self._config.system_prompt]
+        if self._conversation_summary is not None:
+            parts.append(
+                "Compacted conversation context:\n"
+                f"{self._conversation_summary}"
+            )
         if self._system_context_provider is None:
-            return self._config.system_prompt
+            return "\n\n".join(parts)
         context = self._system_context_provider()
         if not context:
-            return self._config.system_prompt
+            return "\n\n".join(parts)
         stripped = context.strip()
         if not stripped:
-            return self._config.system_prompt
-        return f"{self._config.system_prompt}\n\n{stripped}"
+            return "\n\n".join(parts)
+        parts.append(stripped)
+        return "\n\n".join(parts)
 
     @staticmethod
     def _user_message(transcript: str) -> ChatMessage:
@@ -257,6 +283,9 @@ class CerebrasResponder:
 
     def _remember_turn(self, user_message: ChatMessage, assistant_text: str) -> None:
         if not self._config.stateful:
+            return
+        if self._skip_current_turn_memory:
+            self._skip_current_turn_memory = False
             return
         self._history.append(dict(user_message))
         self._history.append({"role": "assistant", "content": assistant_text})

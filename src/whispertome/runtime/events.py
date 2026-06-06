@@ -32,6 +32,8 @@ class RuntimeEvent:
 
 EventListener = Callable[[RuntimeEvent], None]
 
+_STOP = object()  # sentinel enqueued by stop() to release the blocking dispatcher
+
 
 class EventBus:
     """Thread-safe, non-blocking publish; background dispatch to listeners.
@@ -43,7 +45,7 @@ class EventBus:
 
     def __init__(self) -> None:
         self._listeners: list[EventListener] = []
-        self._queue: "queue.Queue[RuntimeEvent]" = queue.Queue()
+        self._queue: "queue.Queue[object]" = queue.Queue()  # RuntimeEvent | _STOP
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
@@ -54,6 +56,7 @@ class EventBus:
         if self._thread is not None:
             return
         self._stop.clear()
+        self._queue = queue.Queue()  # drop any stale _STOP sentinel from a prior stop()
         self._thread = threading.Thread(target=self._dispatch_loop, name="event-bus", daemon=True)
         self._thread.start()
 
@@ -62,6 +65,7 @@ class EventBus:
         thread = self._thread
         self._thread = None
         if thread is not None:
+            self._queue.put(_STOP)  # unblock the dispatcher immediately
             thread.join(timeout=1.0)
 
     def publish(self, event: RuntimeEvent) -> None:
@@ -71,11 +75,13 @@ class EventBus:
             self._queue.put(event)
 
     def _dispatch_loop(self) -> None:
+        # Block on the queue (no idle polling) so an idle session spends zero CPU here —
+        # the dispatcher only wakes when an event actually arrives. A _STOP sentinel from
+        # stop() releases the block at shutdown.
         while not self._stop.is_set():
-            try:
-                event = self._queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
+            event = self._queue.get()
+            if event is _STOP:
+                break
             self._fan_out(event)
 
     def _fan_out(self, event: RuntimeEvent) -> None:

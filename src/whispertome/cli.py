@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 from time import perf_counter
 from typing import Any
 
@@ -988,19 +988,41 @@ def run_wake_loop(
     ui.boot("tts adapter", config.tts.backend, 0.16)
     organizer_store = build_organizer_store(config.project_root)
     ui.boot("memory bus", "sqlite organizer and preferences", 0.22)
+    from whispertome.llm.conversation_tools import (
+        ConversationController,
+        build_conversation_tools,
+    )
     from whispertome.tts.voice_tools import TtsVoiceController, build_voice_tools
 
     voice_controller = TtsVoiceController()
     voice_controller.bind(tts_model)
+    conversation_controller = ConversationController()
+    from whispertome.scheduler.clock import Clock as _SchedClock
+    from whispertome.scheduler.tools import build_scheduler_tools
+
+    _scheduler_holder: dict = {}
+    tool_registry = build_organization_tool_registry(
+        config.project_root,
+        store=organizer_store,
+        extra_tools=[
+            *build_voice_tools(voice_controller),
+            *build_conversation_tools(conversation_controller),
+            *build_scheduler_tools(
+                store=organizer_store,
+                clock=_SchedClock(),
+                name_provider=lambda: set(tool_registry.tool_names()),
+                on_change=lambda: (
+                    _scheduler_holder["sched"].wake() if "sched" in _scheduler_holder else None
+                ),
+            ),
+        ],
+    )
     responder = build_llm_responder(
         config,
-        tool_registry=build_organization_tool_registry(
-            config.project_root,
-            store=organizer_store,
-            extra_tools=build_voice_tools(voice_controller),
-        ),
+        tool_registry=tool_registry,
         system_context_provider=organizer_store.preference_prompt_context,
     )
+    conversation_controller.bind(responder)
     speaker = SpeakerOutput() if play else None
     audio_ducker = WindowsBackgroundAudioDucker(
         target_percent=config.system.wake_duck_percent,
@@ -1015,6 +1037,71 @@ def run_wake_loop(
     router = WakeCommandRouter(SlidingWakeDetector(config.wake))
     segmenter = UtteranceSegmenter(config.audio, EnergyVad(active_vad_threshold))
     stt_lock = Lock()
+    # turn_lock serializes scheduled-event firing and idle compaction with live conversation
+    # turns + playback so audio (a process-global device) never overlaps. Held only around a
+    # turn, not while listening. Reentrant so a usage-triggered compaction inside a turn (which
+    # already holds the lock) doesn't self-deadlock; cross-thread mutual exclusion still holds.
+    turn_lock = RLock()
+
+    def scheduler_speak(text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        try:
+            result = tts_model.synthesize(text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("scheduled_speak_failed error=%s", exc)
+            return
+        if speaker is not None:
+            speaker.play(result.speech)
+
+    def scheduler_on_fire(event: dict) -> None:
+        signal_wake_event("scheduled_event_fired")
+        try:
+            ui.status("scheduled event", str(event.get("title", "")))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def scheduler_on_recover(orphans: list) -> None:
+        for orphan in orphans:
+            logger.warning("scheduled_event_needs_review title=%r", orphan.get("title"))
+
+    scheduler = None
+    if config.scheduler.enabled:
+        from whispertome.scheduler.executor import ActionExecutor
+        from whispertome.scheduler.scheduler import SchedulerThread
+
+        scheduler = SchedulerThread(
+            store=organizer_store,
+            executor=ActionExecutor(
+                tool_registry=tool_registry,
+                speak=scheduler_speak,
+                step_timeout_s=config.scheduler.step_timeout_s,
+                logger=logger,
+            ),
+            clock=_SchedClock(),
+            turn_lock=turn_lock,
+            on_fire=scheduler_on_fire,
+            on_recover=scheduler_on_recover,
+            on_view=lambda title, epoch: ui.next_event(title, epoch),
+            check_interval_s=config.scheduler.check_interval_s,
+            max_sleep_s=config.scheduler.max_sleep_s,
+            logger=logger,
+        )
+        _scheduler_holder["sched"] = scheduler
+
+    from whispertome.llm.compaction import ConversationCompactionManager
+
+    compaction_manager = ConversationCompactionManager(
+        controller=conversation_controller,
+        turn_lock=turn_lock,
+        idle_enabled=config.conversation.idle_compact_enabled,
+        idle_timeout_s=config.conversation.idle_compact_seconds,
+        usage_enabled=config.conversation.usage_compact_enabled,
+        context_window_tokens=config.conversation.context_window_tokens,
+        threshold_pct=config.conversation.compact_threshold_pct,
+        logger=logger,
+    )
 
     def duck_background_audio(reason: str, *, turn_number: int | None = None) -> None:
         result = audio_ducker.duck()
@@ -1096,6 +1183,20 @@ def run_wake_loop(
             print(
                 "Wake loop ready. Say one of: "
                 f"{', '.join(config.wake.phrases)}. Press Ctrl+C to quit."
+            )
+
+        if scheduler is not None:
+            scheduler.start()
+            logger.info(
+                "scheduler_started check_interval_s=%.0f", config.scheduler.check_interval_s
+            )
+        compaction_manager.start()
+        if config.conversation.idle_compact_enabled:
+            logger.info(
+                "idle_compaction_started idle_s=%.0f usage_window=%d threshold=%.2f",
+                config.conversation.idle_compact_seconds,
+                config.conversation.context_window_tokens,
+                config.conversation.compact_threshold_pct,
             )
 
         utterance_count = 0
@@ -1546,6 +1647,7 @@ def run_wake_loop(
                 ui.status("barge-in command", queued_command.command)
                 ui.line(f"barge-in queued: {queued_command.command}")
 
+            compaction_manager.note_turn(llm_response)
             logger.info(
                 (
                     "wake_turn_profile turn=%d utterance=%d source=%s total_ms=%.1f "
@@ -1576,15 +1678,17 @@ def run_wake_loop(
             stt_latency_ms: float,
         ) -> CommandTurnResult:
             try:
-                return run_command_turn(
-                    command,
-                    utterance_index=utterance_index,
-                    source=source,
-                    source_transcript=source_transcript,
-                    utterance_started=utterance_started,
-                    stt_wall_ms=stt_wall_ms,
-                    stt_latency_ms=stt_latency_ms,
-                )
+                # turn_lock keeps a scheduled event from speaking/acting over a live turn.
+                with turn_lock:
+                    return run_command_turn(
+                        command,
+                        utterance_index=utterance_index,
+                        source=source,
+                        source_transcript=source_transcript,
+                        utterance_started=utterance_started,
+                        stt_wall_ms=stt_wall_ms,
+                        stt_latency_ms=stt_latency_ms,
+                    )
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
@@ -1748,6 +1852,10 @@ def run_wake_loop(
     finally:
         if stop_requested():
             logger.info("wake_external_stop_requested phase=finally")
+        if scheduler is not None:
+            scheduler.stop()
+        if "compaction_manager" in locals():
+            compaction_manager.stop()
         close = getattr(locals().get("chunks", None), "close", None)
         if close is not None:
             close()
@@ -1796,19 +1904,26 @@ def run_demo(
         logger.info("demo_npu_only_policy=true")
 
     from whispertome.audio.playback import SpeakerOutput
+    from whispertome.llm.conversation_tools import (
+        ConversationController,
+        build_conversation_tools,
+    )
     from whispertome.llm.factory import build_llm_responder
     from whispertome.organizer.tools import build_organization_tool_registry, build_organizer_store
     from whispertome.text.markdown import parse_spoken_markdown
 
     organizer_store = build_organizer_store(config.project_root)
+    conversation_controller = ConversationController()
     responder = build_llm_responder(
         config,
         tool_registry=build_organization_tool_registry(
             config.project_root,
             store=organizer_store,
+            extra_tools=build_conversation_tools(conversation_controller),
         ),
         system_context_provider=organizer_store.preference_prompt_context,
     )
+    conversation_controller.bind(responder)
     speaker = SpeakerOutput() if play else None
     stt_model = prepare_stt_model(
         config,
@@ -2564,18 +2679,25 @@ def record_audio_buffer(sample_rate: int, duration_ms: int):
 
 def run_test_openai(config: AppConfig, text: str, *, reset: bool) -> int:
     logger = logging.getLogger(__name__)
+    from whispertome.llm.conversation_tools import (
+        ConversationController,
+        build_conversation_tools,
+    )
     from whispertome.llm.factory import build_llm_responder
     from whispertome.organizer.tools import build_organization_tool_registry, build_organizer_store
 
     organizer_store = build_organizer_store(config.project_root)
+    conversation_controller = ConversationController()
     responder = build_llm_responder(
         config,
         tool_registry=build_organization_tool_registry(
             config.project_root,
             store=organizer_store,
+            extra_tools=build_conversation_tools(conversation_controller),
         ),
         system_context_provider=organizer_store.preference_prompt_context,
     )
+    conversation_controller.bind(responder)
     if reset:
         responder.reset_conversation()
 

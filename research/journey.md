@@ -976,3 +976,138 @@ right and bottom margins without clipping. The host also keeps full-screen TUI f
 the top so old scrollback cannot hide the current frame.
 
 Verified with a fresh app run, screenshot comparison, focused desktop/TUI tests, and ruff.
+
+### Milestone 33: Conversation compaction and new-chat tools
+
+Added provider-neutral conversation tools so the spoken agent can manage its own chat context:
+`conversation_compact` keeps a concise carry-forward summary, and
+`conversation_start_new` clears the active chat thread. Both preserve organizer data such as
+notes, preferences, reminders, tasks, and checklists.
+
+Win: OpenAI Responses and Cerebras Chat now share the same `LlmResponder` surface:
+`reset_conversation()` and `compact_conversation(summary)`. OpenAI drops the next
+`previous_response_id`; Cerebras clears local `_history`; both inject compacted summaries into
+system instructions. The tricky loss/risk was tool-loop timing: the current tool call still
+needs one provider follow-up, so reset/compact triggered from a tool is applied for the next
+user turn instead of breaking the in-flight function-call response.
+
+Verified with direct responder tests, tool-triggered reset tests, registry tests, ruff, and the
+full suite.
+
+## Milestone 32: App-wide latency + energy pass (modular, critic-reviewed)
+
+Goal: tighter/faster/lower-energy without breaking things, kept modular, with a critiquing
+subagent guarding each change. Measured baseline first (data-driven): STT 465ms (26 decode
+tokens x 11.1ms), TTS short-reply floor ~321ms; vector_estimator cost is ~linear in frames
+(48->179ms, 96->293ms, 192->534ms for the 10-step loop). LLM is network (out of local scope).
+
+Wins (each verified, 136 tests passing):
+- **TTS smaller frame bucket**: `FRAME_BUCKETS (96,192) -> (48,96,192)`. Short/tiny replies (the
+  common case) route to the 48-frame graph: **321ms -> ~200ms (~38% faster)**; medium unchanged.
+  Masking makes bucket size output-irrelevant (critic-verified). Cost: cold compile builds 8
+  graphs (2 text + 2 stages x 3 buckets), one-time (cached); warm load unaffected.
+- **Event bus idle CPU eliminated**: dispatch loop changed from `queue.get(timeout=0.1)`
+  (10 Hz idle polling) to a blocking `get()` with a `_STOP` sentinel. Critic caught a stale-
+  sentinel restart bug -> fixed by recreating the queue in `start()`; added a stop->restart
+  regression test.
+- **TUI render idle/active throttle**: was a constant 24 FPS free-run. Now env-tunable
+  `WHISPERTOME_TUI_FPS` (default 5) / `WHISPERTOME_TUI_IDLE_FPS` (default 2), switching via
+  `_is_animation_active()` (boot / activity>0.05 / active status). ~5x fewer active redraws,
+  ~12x fewer idle. Responsiveness preserved: every state setter calls `_request_render()` so
+  changes wake the renderer instantly regardless of FPS. Tightened `clear()` ordering per critic.
+
+Abstractions kept clean: bucketing lives in the TTS adapter; the event bus is the existing
+runtime API; FPS is config/env like the other knobs. Two critic subagent passes (changes 1-2,
+then 3) found 1 real bug (fixed) + the FPS-ordering nit (tightened); no regressions.
+
+Remaining levers (not done; risk/coordination): STT per-token decode (IO-binding cross caches,
+QNN-support-uncertain), even smaller TTS buckets for one-word replies, and the wake-loop running
+full STT on every utterance (would need a cheap pre-gate). Render loop lives in the peer's
+actively-edited terminal.py — changes may get reworked by them.
+
+## Milestone 33: "Switch to <app>" via list-and-match window tools
+
+User wanted "switch to chrome" to alt-tab to Chrome. From the desktop run log, the model
+could already open URLs via powershell Start-Process, but had no way to focus existing windows
+and sometimes refused. Chosen design (user's suggestion): let the MODEL do the fuzzy match
+against the real window list, rather than alias-matching inside a tool.
+
+- `system/windows.py`: `WindowInfo`, `WindowSwitcher` protocol, `WindowsWindowSwitcher` with
+  `list_windows()` (EnumWindows + per-window exe stem via OpenProcess/QueryFullProcessImageNameW,
+  excludes the assistant's own window) and `focus_window(hwnd)` (AttachThreadInput workaround for
+  the Windows foreground lock: attach to target+foreground threads, SW_RESTORE if minimized,
+  SetForegroundWindow/BringWindowToTop/SetActiveWindow, verify via GetForegroundWindow). Pure
+  ctypes, no new deps; HANDLE argtypes/restypes set so 64-bit handles are not truncated on ARM64.
+- `system/tools.py`: two agent tools `list_windows` (returns [{hwnd, app, title}]) and
+  `focus_window(hwnd)`, added to `build_system_control_tools` via a `window_switcher` param.
+- System prompt: instructs the model to call list_windows, pick the closest app/title to the
+  user's words (loose match: "email"->Outlook, "browser"->Chrome/Edge), then focus_window(hwnd);
+  say which apps are open if nothing matches. Distinguished from the browser-open web instructions.
+
+Verified live on this machine: list_windows returned 12 real windows; "switch to chrome" matched
+and focus_window brought Chrome to the foreground (ok=True). 4 new unit tests (fake switcher);
+140 tests pass.
+
+Also (prior turn) Milestone for web/browser: system prompt now tells the model it CAN open
+Google search / Maps / sites in the browser via Start-Process '<url>' and that opening links is
+not state-changing (no confirmation) — fixing the logged "I can't browse the web" refusal and the
+"need your okay first" stall.
+
+## Milestone 34: Scheduled events & reminders that fire
+
+Closed the journey-M16 gap (reminders persisted but never fired). New `scheduler/` package
+(model/clock/executor/recurrence/scheduler/tools) — core is audio/NPU-free and unit-tested.
+Decisions (user): in-process scheduler + catch-up; full autonomous execution; structured
+recorded tool sequences (deterministic replay, NO LLM at fire time).
+
+- Persistence: `scheduled_events` table on OrganizerStore with an atomic claim CAS
+  (`UPDATE ... WHERE status='pending' AND next_fire_at=?`) that makes double-fire impossible;
+  crash orphans (`firing` at startup) -> `needs_review`, never replayed.
+- Action = ordered steps {speak|tool}; ActionExecutor replays deterministically, never raises,
+  per-step tool watchdog, `{stepN.key}` literal templating for dynamic readback.
+- SchedulerThread: catch-up + recover on start, wakeable Condition loop (lost-wakeup fixed via
+  `_pending_wake`), fires under a shared `turn_lock` so audio never overlaps a live turn.
+- Recurrence: daily@HH:MM, weekly@<dow>@HH:MM, every@N@minutes|hours (local-tz for daily/weekly).
+- Tools: schedule_event/list_scheduled_events/cancel_scheduled_event with save-time tool-name
+  validation (AgentToolRegistry.tool_names()); wired into run_wake_loop (turn_lock + scheduler_speak
+  + start/stop) and pipeline creation tools; SchedulerConfig + env; system-prompt guidance.
+
+Verified: 11 scheduler unit tests (double-fire, crash recovery w/o replay, recurring advance +
+backlog collapse, catch-up, tool-failure paths, step-timeout bound, templating, validation,
+recurrence) + end-to-end with the REAL organizer registry (scheduled workflow ran notes_add and
+spoke a confirmation). 151 tests pass. A critic subagent confirmed all 8 invariants hold and
+flagged 1 MEDIUM (timed-out tool side effects — mitigated: speak is inline, tools emit no audio)
++ 1 LOW (lost wakeup — fixed).
+
+## Milestone 35: Scheduler eval fixes + "next up" TUI chip
+
+Eval found: a scheduled "open Chrome -> facebook" reminder fired but did nothing. Root cause:
+the LLM authored the powershell_run step with allow_mutation=False, so the PowerShell tool
+blocked Start-Process (a mutation). Scheduler/executor were correct; the action was self-blocked.
+Fix: scheduling IS authorization and fired events run unattended, so `schedule_event` now
+pre-authorizes powershell_run steps (`_preauthorize_steps` -> allow_mutation=True). Truly
+destructive patterns stay hard-blocked regardless (independent of allow_mutation).
+
+Also (prior request): the TUI header now shows a live "NEXT <title> in Xm" agenda chip
+(top-right, before the clock), counting down each frame. Plumbing: TerminalUiState
+next_event_title/epoch + set_next_event + TerminalVoiceUi.next_event; SchedulerThread.on_view +
+_refresh_view (called on start, after each fire pass, and on wake) reading
+OrganizerStore.next_pending_event(); wired in run_wake_loop as on_view -> ui.next_event. 151 pass.
+
+## Milestone 36: Idle + usage ("Codex") auto-compaction
+
+Two triggers feeding one compaction action (ConversationController.auto_compact: summarize via
+the model -> compact_conversation(summary), reset fallback):
+- Idle: after WHISPERTOME_IDLE_COMPACT_SECONDS (default 3600 = 1 hour) with no turn, compact.
+  Background daemon thread; activity resets the timer.
+- Usage (Codex strategy): after a turn whose NON-CACHED context tokens cross
+  WHISPERTOME_COMPACT_THRESHOLD_PCT (0.75) of WHISPERTOME_CONTEXT_WINDOW_TOKENS (128000),
+  compact proactively. Cached prompt tokens excluded ("context % less the context cache").
+  To enable this, LlmResponse now carries input/cached/output tokens, captured from the
+  Responses API usage (batch, streaming, and tool paths) via _usage_from().
+
+New `llm/compaction.py` ConversationCompactionManager (note_turn + idle thread), `ConversationConfig`
+in config, wired into run_wake_loop (note_turn per turn, start/stop, on the shared turn_lock).
+CRITICAL fix found during impl: note_turn runs inside a turn that already holds turn_lock, and the
+usage trigger re-acquires it -> self-deadlock. Made turn_lock an RLock (reentrant for same-thread,
+still mutually exclusive across the scheduler/idle threads); added a regression test. 160 tests pass.

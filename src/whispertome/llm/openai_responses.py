@@ -42,6 +42,9 @@ class OpenAIResponder:
         self._system_context_provider = system_context_provider
         self._max_tool_iterations = max_tool_iterations
         self._last_response_id: str | None = None
+        self._conversation_summary: str | None = None
+        self._reset_after_current_response = False
+        self._executing_tool_call = False
 
     def generate(
         self,
@@ -73,7 +76,7 @@ class OpenAIResponder:
         text = _extract_output_text(response)
         response_id = getattr(response, "id", None)
         if self._config.stateful and response_id:
-            self._last_response_id = str(response_id)
+            self._remember_response_id(str(response_id))
 
         return LlmResponse(
             text=text,
@@ -136,17 +139,33 @@ class OpenAIResponder:
 
         response_id = getattr(completed_response, "id", None)
         if self._config.stateful and response_id:
-            self._last_response_id = str(response_id)
+            self._remember_response_id(str(response_id))
 
+        inp, cached, out = _usage_from(completed_response)
         return LlmResponse(
             text=text,
             latency_ms=elapsed_ms,
             model=self._config.model,
             response_id=str(response_id) if response_id else None,
+            input_tokens=inp,
+            cached_tokens=cached,
+            output_tokens=out,
         )
 
     def reset_conversation(self) -> None:
         self._last_response_id = None
+        self._conversation_summary = None
+        if self._executing_tool_call:
+            self._reset_after_current_response = True
+
+    def compact_conversation(self, summary: str) -> None:
+        stripped = " ".join(str(summary).strip().split())
+        if not stripped:
+            raise ValueError("summary cannot be empty")
+        self._conversation_summary = stripped
+        self._last_response_id = None
+        if self._executing_tool_call:
+            self._reset_after_current_response = True
 
     def _build_request_kwargs(self, transcript: str) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
@@ -188,15 +207,22 @@ class OpenAIResponder:
         kwargs["max_tool_calls"] = 4
 
     def _instructions(self) -> str:
+        parts = [self._config.system_prompt]
+        if self._conversation_summary is not None:
+            parts.append(
+                "Compacted conversation context:\n"
+                f"{self._conversation_summary}"
+            )
         if self._system_context_provider is None:
-            return self._config.system_prompt
+            return "\n\n".join(parts)
         context = self._system_context_provider()
         if not context:
-            return self._config.system_prompt
+            return "\n\n".join(parts)
         stripped = context.strip()
         if not stripped:
-            return self._config.system_prompt
-        return f"{self._config.system_prompt}\n\n{stripped}"
+            return "\n\n".join(parts)
+        parts.append(stripped)
+        return "\n\n".join(parts)
 
     def _generate_with_tools(
         self,
@@ -272,13 +298,17 @@ class OpenAIResponder:
 
         response_id = _response_id(completed_response)
         if self._config.stateful and response_id:
-            self._last_response_id = response_id
+            self._remember_response_id(response_id)
 
+        inp, cached, out = _usage_from(completed_response)
         return LlmResponse(
             text=text,
             latency_ms=elapsed_ms,
             model=self._config.model,
             response_id=response_id,
+            input_tokens=inp,
+            cached_tokens=cached,
+            output_tokens=out,
         )
 
     def _consume_agent_stream(
@@ -333,7 +363,11 @@ class OpenAIResponder:
                     latency_ms=0.0,
                 )
             else:
-                event = self._tool_registry.execute(call.name, arguments)
+                self._executing_tool_call = True
+                try:
+                    event = self._tool_registry.execute(call.name, arguments)
+                finally:
+                    self._executing_tool_call = False
             image_messages = _tool_image_messages(call.name, event.output)
             public_output = _public_tool_output(event.output)
             public_event = (
@@ -363,13 +397,24 @@ class OpenAIResponder:
         text = _extract_output_text(response)
         response_id = _response_id(response)
         if self._config.stateful and response_id:
-            self._last_response_id = response_id
+            self._remember_response_id(response_id)
+        inp, cached, out = _usage_from(response)
         return LlmResponse(
             text=text,
             latency_ms=elapsed_ms,
             model=self._config.model,
             response_id=response_id,
+            input_tokens=inp,
+            cached_tokens=cached,
+            output_tokens=out,
         )
+
+    def _remember_response_id(self, response_id: str) -> None:
+        if self._reset_after_current_response:
+            self._last_response_id = None
+            self._reset_after_current_response = False
+            return
+        self._last_response_id = response_id
 
     @staticmethod
     def _build_input(transcript: str) -> list[dict[str, Any]]:
@@ -402,6 +447,34 @@ def _response_id(response: Any | None) -> str | None:
         return None
     value = getattr(response, "id", None)
     return str(value) if value else None
+
+
+def _usage_from(response: Any | None) -> tuple[int | None, int | None, int | None]:
+    """Extract (input_tokens, cached_tokens, output_tokens) from a Responses result.
+    Robust to object- or dict-shaped usage and missing fields."""
+    usage = getattr(response, "usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("usage")
+    if usage is None:
+        return (None, None, None)
+
+    def _get(obj: Any, key: str) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    inp = _get(usage, "input_tokens")
+    out = _get(usage, "output_tokens")
+    details = _get(usage, "input_tokens_details")
+    cached = _get(details, "cached_tokens") if details is not None else None
+
+    def _int(v: Any) -> int | None:
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return (_int(inp), _int(cached), _int(out))
 
 
 def _extract_function_calls(response: Any) -> list[FunctionCall]:

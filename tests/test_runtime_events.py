@@ -48,6 +48,23 @@ class EventBusTests(unittest.TestCase):
         self.assertEqual(len(seen), 1)
         self.assertEqual(seen[0].text, "hi")
 
+    def test_restart_after_stop_delivers_events(self) -> None:
+        # Regression: a stale _STOP sentinel must not survive into a restarted bus.
+        bus = EventBus()
+        seen: list[RuntimeEvent] = []
+        bus.subscribe(seen.append)
+        bus.start()
+        bus.stop()
+        bus.start()
+        try:
+            bus.publish(RuntimeEvent(source="stt", kind="final", text="after-restart"))
+            deadline = time.time() + 1.0
+            while not seen and time.time() < deadline:
+                time.sleep(0.01)
+        finally:
+            bus.stop()
+        self.assertEqual([e.text for e in seen], ["after-restart"])
+
     def test_listener_errors_are_isolated(self) -> None:
         bus = EventBus()
         good: list[RuntimeEvent] = []

@@ -14,6 +14,9 @@ class LlmResponse:
     latency_ms: float
     model: str
     response_id: str | None
+    input_tokens: int | None = None
+    cached_tokens: int | None = None
+    output_tokens: int | None = None
 
 
 class LlmResponder(Protocol):
@@ -33,6 +36,8 @@ class LlmResponder(Protocol):
     ) -> LlmResponse: ...
 
     def reset_conversation(self) -> None: ...
+
+    def compact_conversation(self, summary: str) -> None: ...
 
 
 def build_dictation_user_text(transcript: str) -> str:

@@ -43,8 +43,37 @@ class VoiceLoop:
         vad = EnergyVad(config.audio.vad_rms_threshold)
         organizer_store = build_organizer_store(config.project_root)
         tts = registry.create_tts()
+        from whispertome.llm.conversation_tools import (
+            ConversationController,
+            build_conversation_tools,
+        )
+        from whispertome.scheduler.clock import Clock
+        from whispertome.scheduler.tools import build_scheduler_tools
+
         voice_controller = TtsVoiceController()
         voice_controller.bind(tts)
+        conversation_controller = ConversationController()
+        # Scheduled-event creation tools (firing happens in the run_wake_loop runtime).
+        tool_registry = build_organization_tool_registry(
+            config.project_root,
+            store=organizer_store,
+            extra_tools=[
+                *build_voice_tools(voice_controller),
+                *build_conversation_tools(conversation_controller),
+                *build_scheduler_tools(
+                    store=organizer_store,
+                    clock=Clock(),
+                    name_provider=lambda: set(tool_registry.tool_names()),
+                    on_change=lambda: None,
+                ),
+            ],
+        )
+        responder = build_llm_responder(
+            config,
+            tool_registry=tool_registry,
+            system_context_provider=organizer_store.preference_prompt_context,
+        )
+        conversation_controller.bind(responder)
         return cls(
             config=config,
             components=VoiceLoopComponents(
@@ -52,15 +81,7 @@ class VoiceLoop:
                 speaker=SpeakerOutput(),
                 stt=registry.create_stt(),
                 tts=tts,
-                responder=build_llm_responder(
-                    config,
-                    tool_registry=build_organization_tool_registry(
-                        config.project_root,
-                        store=organizer_store,
-                        extra_tools=build_voice_tools(voice_controller),
-                    ),
-                    system_context_provider=organizer_store.preference_prompt_context,
-                ),
+                responder=responder,
                 wake_router=WakeCommandRouter(SlidingWakeDetector(config.wake)),
                 segmenter=UtteranceSegmenter(config.audio, vad),
             ),

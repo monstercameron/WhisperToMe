@@ -1115,12 +1115,30 @@ class OrganizerStore:
                 active INTEGER NOT NULL DEFAULT 1,
                 priority INTEGER NOT NULL DEFAULT 50
             );
+            CREATE TABLE IF NOT EXISTS scheduled_events (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                title TEXT NOT NULL,
+                action_json TEXT NOT NULL,
+                trigger TEXT NOT NULL,
+                next_fire_at TEXT,
+                recurrence_rule TEXT,
+                status TEXT NOT NULL,
+                last_fired_at TEXT,
+                fire_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                lease_token TEXT,
+                lease_pid INTEGER
+            );
             CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(due_date, due_time);
             CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_date, due_time);
             CREATE INDEX IF NOT EXISTS idx_itinerary_date ON itinerary(date, start_time);
             CREATE INDEX IF NOT EXISTS idx_daily_plans_date ON daily_plans(date);
             CREATE INDEX IF NOT EXISTS idx_preferences_active
                 ON preferences(active, priority, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_scheduled_events_due
+                ON scheduled_events(status, next_fire_at);
             """
         )
 
@@ -1322,6 +1340,184 @@ class OrganizerStore:
         if not matches:
             raise ValueError("checklist item not found")
         raise ValueError("multiple matching checklist items; use item_id")
+
+    # ---- scheduled events (fired by the in-process scheduler) -------------
+
+    _SCHED_COLUMNS = (
+        "id", "created_at", "updated_at", "title", "action_json", "trigger",
+        "next_fire_at", "recurrence_rule", "status", "last_fired_at",
+        "fire_count", "last_error", "lease_token", "lease_pid",
+    )
+
+    def add_scheduled_event(
+        self,
+        *,
+        title: str,
+        action_json: str,
+        trigger: str,
+        next_fire_at: str | None,
+        recurrence_rule: str | None = None,
+    ) -> JsonObject:
+        if trigger not in ("one_shot", "recurring"):
+            raise ValueError("trigger must be 'one_shot' or 'recurring'")
+        event = {
+            "id": _new_id("evt"),
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
+            "title": _required_text(title, "event title"),
+            "action_json": action_json,
+            "trigger": trigger,
+            "next_fire_at": _clean_optional(next_fire_at),
+            "recurrence_rule": _clean_optional(recurrence_rule),
+            "status": "pending",
+            "last_fired_at": None,
+            "fire_count": 0,
+            "last_error": None,
+            "lease_token": None,
+            "lease_pid": None,
+        }
+        placeholders = ", ".join("?" for _ in self._SCHED_COLUMNS)
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                f"INSERT INTO scheduled_events ({', '.join(self._SCHED_COLUMNS)}) "
+                f"VALUES ({placeholders})",
+                _row_values(event, *self._SCHED_COLUMNS),
+            )
+        return event
+
+    def list_scheduled_events(
+        self, *, include_terminal: bool = False, limit: int = 20
+    ) -> list[JsonObject]:
+        sql = "SELECT * FROM scheduled_events"
+        if not include_terminal:
+            sql += " WHERE status IN ('pending', 'firing', 'needs_review')"
+        sql += " ORDER BY next_fire_at IS NULL, next_fire_at, created_at DESC LIMIT ?"
+        with self._lock, self._connection() as conn:
+            rows = conn.execute(sql, (max(1, limit),)).fetchall()
+        return [dict(row) for row in rows]
+
+    def cancel_scheduled_event(
+        self, *, event_id: str | None = None, title_query: str | None = None
+    ) -> JsonObject:
+        with self._lock, self._connection() as conn:
+            event = self._find_by_id_or_query(
+                conn,
+                table="scheduled_events",
+                item_id=event_id,
+                query=title_query,
+                query_column="title",
+                open_status=False,
+            )
+            if event.get("status") == "firing":
+                raise ValueError("event is currently firing; cannot cancel")
+            conn.execute(
+                "UPDATE scheduled_events SET status = 'cancelled', next_fire_at = NULL, "
+                "updated_at = ? WHERE id = ?",
+                (_now_iso(), event["id"]),
+            )
+            event.update(status="cancelled", next_fire_at=None)
+        return event
+
+    def get_due_events(self, now_iso: str, *, limit: int = 20) -> list[JsonObject]:
+        with self._lock, self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scheduled_events WHERE status = 'pending' "
+                "AND next_fire_at IS NOT NULL AND next_fire_at <= ? "
+                "ORDER BY next_fire_at LIMIT ?",
+                (now_iso, max(1, limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def next_pending_event(self) -> JsonObject | None:
+        """The soonest upcoming event (for the 'next up' display)."""
+        with self._lock, self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM scheduled_events WHERE status = 'pending' "
+                "AND next_fire_at IS NOT NULL ORDER BY next_fire_at LIMIT 1"
+            ).fetchone()
+        return dict(row) if row else None
+
+    def peek_next_fire_at(self) -> str | None:
+        with self._lock, self._connection() as conn:
+            row = conn.execute(
+                "SELECT MIN(next_fire_at) AS next FROM scheduled_events "
+                "WHERE status = 'pending' AND next_fire_at IS NOT NULL"
+            ).fetchone()
+        return row["next"] if row else None
+
+    def claim_event_for_fire(
+        self,
+        *,
+        event_id: str,
+        expected_next_fire_at: str,
+        lease_token: str,
+        lease_pid: int,
+    ) -> JsonObject | None:
+        """Atomic claim: returns the row iff it was still pending at expected_next_fire_at.
+
+        The next_fire_at equality is an optimistic-lock version that makes double-fire
+        impossible across the catch-up scan, the due loop, and concurrent processes."""
+        with self._lock, self._connection() as conn:
+            cur = conn.execute(
+                "UPDATE scheduled_events SET status = 'firing', lease_token = ?, "
+                "lease_pid = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'pending' AND next_fire_at = ?",
+                (lease_token, lease_pid, _now_iso(), event_id, expected_next_fire_at),
+            )
+            if cur.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM scheduled_events WHERE id = ?", (event_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def complete_one_shot(self, event_id: str, *, fired_at: str) -> None:
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                "UPDATE scheduled_events SET status = 'done', next_fire_at = NULL, "
+                "last_fired_at = ?, fire_count = fire_count + 1, last_error = NULL, "
+                "lease_token = NULL, lease_pid = NULL, updated_at = ? "
+                "WHERE id = ? AND status = 'firing'",
+                (fired_at, _now_iso(), event_id),
+            )
+
+    def reschedule_recurring(
+        self, event_id: str, *, next_fire_at: str, fired_at: str, last_error: str | None = None
+    ) -> None:
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                "UPDATE scheduled_events SET status = 'pending', next_fire_at = ?, "
+                "last_fired_at = ?, fire_count = fire_count + 1, last_error = ?, "
+                "lease_token = NULL, lease_pid = NULL, updated_at = ? "
+                "WHERE id = ? AND status = 'firing'",
+                (next_fire_at, fired_at, last_error, _now_iso(), event_id),
+            )
+
+    def mark_event_failed(self, event_id: str, *, error: str, fired_at: str) -> None:
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                "UPDATE scheduled_events SET status = 'failed', next_fire_at = NULL, "
+                "last_fired_at = ?, fire_count = fire_count + 1, last_error = ?, "
+                "lease_token = NULL, lease_pid = NULL, updated_at = ? "
+                "WHERE id = ? AND status = 'firing'",
+                (fired_at, error, _now_iso(), event_id),
+            )
+
+    def recover_orphaned_firing(self) -> list[JsonObject]:
+        """Events left 'firing' by a crash: surface as needs_review; never auto-replay."""
+        with self._lock, self._connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scheduled_events WHERE status = 'firing'"
+            ).fetchall()
+            orphans = [dict(row) for row in rows]
+            if orphans:
+                conn.execute(
+                    "UPDATE scheduled_events SET status = 'needs_review', next_fire_at = NULL, "
+                    "last_error = 'interrupted mid-fire', lease_token = NULL, lease_pid = NULL, "
+                    "updated_at = ? WHERE status = 'firing'",
+                    (_now_iso(),),
+                )
+        return orphans
 
     def _find_by_id_or_query(
         self,

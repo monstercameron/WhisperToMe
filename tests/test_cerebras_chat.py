@@ -13,6 +13,10 @@ from whispertome.agent.tools import (
 from whispertome.config import CerebrasConfig
 from whispertome.errors import WhisperToMeError
 from whispertome.llm.cerebras_chat import CerebrasResponder
+from whispertome.llm.conversation_tools import (
+    ConversationController,
+    build_conversation_tools,
+)
 
 
 class FakeStream:
@@ -152,6 +156,48 @@ class CaptureToolLoopChatCompletions:
         )
 
 
+class NewChatToolLoopChatCompletions:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 2:
+            return SimpleNamespace(
+                id="chat_tool",
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            role="assistant",
+                            content=None,
+                            tool_calls=[
+                                SimpleNamespace(
+                                    id="call_new_chat",
+                                    type="function",
+                                    function=SimpleNamespace(
+                                        name="conversation_start_new",
+                                        arguments='{"reason":"user asked"}',
+                                    ),
+                                )
+                            ],
+                        )
+                    )
+                ],
+            )
+        return SimpleNamespace(
+            id=f"chat_{len(self.calls)}",
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        role="assistant",
+                        content="Done.",
+                        tool_calls=None,
+                    )
+                )
+            ],
+        )
+
+
 class FakeClient:
     def __init__(self, completions) -> None:
         self.chat = SimpleNamespace(completions=completions)
@@ -209,6 +255,12 @@ def capture_registry() -> AgentToolRegistry:
     )
 
 
+def conversation_registry(
+    controller: ConversationController,
+) -> AgentToolRegistry:
+    return AgentToolRegistry(build_conversation_tools(controller))
+
+
 class CerebrasResponderTests(unittest.TestCase):
     def test_sends_chat_completion_shape(self) -> None:
         completions = FakeChatCompletions()
@@ -239,6 +291,35 @@ class CerebrasResponderTests(unittest.TestCase):
         self.assertIn("first", second_messages[1]["content"])
         self.assertEqual(second_messages[2], {"role": "assistant", "content": "Done."})
         self.assertIn("second", second_messages[3]["content"])
+
+    def test_reset_conversation_clears_local_chat_history(self) -> None:
+        completions = FakeChatCompletions()
+        responder = CerebrasResponder(config(), client=FakeClient(completions))
+
+        responder.generate("first")
+        responder.reset_conversation()
+        responder.generate("second")
+
+        second_messages = completions.calls[1]["messages"]
+        self.assertEqual(len(second_messages), 2)
+        self.assertEqual(second_messages[0]["role"], "system")
+        self.assertIn("second", second_messages[1]["content"])
+        self.assertNotIn("first", second_messages[1]["content"])
+
+    def test_compact_conversation_replaces_history_with_summary(self) -> None:
+        completions = FakeChatCompletions()
+        responder = CerebrasResponder(config(), client=FakeClient(completions))
+
+        responder.generate("first")
+        responder.compact_conversation("User is polishing the desktop TUI.")
+        responder.generate("second")
+
+        second_messages = completions.calls[1]["messages"]
+        self.assertEqual(len(second_messages), 2)
+        self.assertIn("Compacted conversation context", second_messages[0]["content"])
+        self.assertIn("desktop TUI", second_messages[0]["content"])
+        self.assertIn("second", second_messages[1]["content"])
+        self.assertNotIn("first", second_messages[1]["content"])
 
     def test_streaming_responder_emits_deltas(self) -> None:
         completions = FakeChatCompletions()
@@ -302,6 +383,25 @@ class CerebrasResponderTests(unittest.TestCase):
         self.assertNotIn(OPENAI_INPUT_IMAGES_KEY, tool_output)
         self.assertFalse(tool_output["image_attached_to_model"])
         self.assertEqual(tool_output["image_omitted_reason"], "cerebras_chat_text_only")
+
+    def test_new_chat_tool_clears_history_for_next_turn(self) -> None:
+        completions = NewChatToolLoopChatCompletions()
+        controller = ConversationController()
+        responder = CerebrasResponder(
+            config(),
+            client=FakeClient(completions),
+            tool_registry=conversation_registry(controller),
+        )
+        controller.bind(responder)
+
+        responder.generate("old topic")
+        responder.generate("start a new chat")
+        responder.generate("new topic")
+
+        next_messages = completions.calls[3]["messages"]
+        self.assertEqual(len(next_messages), 2)
+        self.assertIn("new topic", next_messages[1]["content"])
+        self.assertNotIn("old topic", next_messages[1]["content"])
 
 
 if __name__ == "__main__":

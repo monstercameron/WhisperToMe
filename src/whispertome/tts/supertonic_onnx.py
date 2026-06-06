@@ -25,7 +25,9 @@ LATENT_DIM = 144  # ttl.latent_dim (24) * chunk_compress_factor (6)
 # Frame-length buckets (latent time steps). Each utterance routes to the smallest bucket
 # that fits its predicted length, so short replies don't pay the full-length diffusion cost.
 # Only vector_estimator/vocoder depend on frame count; text stages are frame-independent.
-FRAME_BUCKETS = (96, 192)
+# Measured vector_estimator cost is ~linear in frames (48->179ms, 96->293ms, 192->534ms for
+# the 10-step loop), so the 48 bucket roughly halves latency for typical short replies.
+FRAME_BUCKETS = (48, 96, 192)
 FRAME_MAX = max(FRAME_BUCKETS)
 
 # Frame-independent stages (depend only on the text window).
@@ -355,6 +357,9 @@ class SupertonicOnnxSynthesizer(TextToSpeechModel):
         wav_len = int(dur_s * self._sample_rate)
         needed = (wav_len + self._chunk - 1) // max(self._chunk, 1)
         frames = self._bucket_for(needed)            # smallest static bucket that fits
+        if ("vector_estimator", frames) not in self._frame_handles:
+            # robustness: if a bucket failed to build, fall back to the largest available
+            frames = max(f for (s, f) in self._frame_handles if s == "vector_estimator")
         latent_len = min(frames, needed)
         ve = self._frame_handles[("vector_estimator", frames)].session
         voc = self._frame_handles[("vocoder", frames)].session
