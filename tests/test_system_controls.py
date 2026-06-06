@@ -10,10 +10,12 @@ from whispertome.system.tools import build_system_control_tools
 from whispertome.system.windows import (
     DESKTOP_WINDOW_COMMAND_FILE_ENV,
     DesktopCaptureResult,
+    PowerShellRunResult,
     SystemVolumeDucker,
     WindowActionResult,
     WindowsAgentWindowController,
     WindowsBackgroundAudioDucker,
+    WindowsPowerShellController,
 )
 
 
@@ -94,6 +96,36 @@ class FakeCaptureController:
         )
 
 
+class FakePowerShellController:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def run(
+        self,
+        command: str,
+        *,
+        timeout_seconds: int = 5,
+        max_output_chars: int = 4000,
+        allow_mutation: bool = False,
+    ) -> PowerShellRunResult:
+        self.calls.append(
+            {
+                "command": command,
+                "timeout_seconds": timeout_seconds,
+                "max_output_chars": max_output_chars,
+                "allow_mutation": allow_mutation,
+            }
+        )
+        return PowerShellRunResult(
+            ok=True,
+            command=command,
+            exit_code=0,
+            stdout="Saturday, June 6, 2026",
+            stderr="",
+            duration_ms=12.3,
+        )
+
+
 class FakeAudioSession:
     def __init__(
         self,
@@ -132,12 +164,14 @@ class SystemControlToolTests(unittest.TestCase):
         brightness = FakeBrightnessController(levels=[40, 60])
         window = FakeWindowController()
         capture = FakeCaptureController()
+        powershell = FakePowerShellController()
         registry = AgentToolRegistry(
             build_system_control_tools(
                 volume_controller=volume,
                 brightness_controller=brightness,
                 window_controller=window,
                 capture_controller=capture,
+                powershell_controller=powershell,
             )
         )
 
@@ -176,6 +210,22 @@ class SystemControlToolTests(unittest.TestCase):
         self.assertEqual(screenshot["preview_width"], 1024)
         self.assertIn("_openai_input_images", screenshot)
         self.assertEqual(capture.calls[0]["max_width"], 1024)
+        shell = registry.execute(
+            "powershell_run",
+            {"command": "Get-Date", "timeout_seconds": 2, "max_output_chars": 500},
+        ).output
+        self.assertTrue(shell["ok"])
+        self.assertEqual(shell["stdout"], "Saturday, June 6, 2026")
+        self.assertEqual(powershell.calls[0]["command"], "Get-Date")
+        self.assertEqual(powershell.calls[0]["timeout_seconds"], 2)
+        self.assertEqual(powershell.calls[0]["max_output_chars"], 500)
+
+    def test_powershell_controller_blocks_high_risk_commands(self) -> None:
+        output = WindowsPowerShellController().run("Remove-Item C:\\important -Recurse")
+
+        self.assertFalse(output.ok)
+        self.assertTrue(output.blocked)
+        self.assertIn("blocked", output.reason or "")
 
     def test_agent_window_minimize_reports_unavailable_window(self) -> None:
         window = FakeWindowController(

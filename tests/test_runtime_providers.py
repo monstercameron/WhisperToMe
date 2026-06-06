@@ -12,6 +12,8 @@ from whispertome.runtime.providers import ProviderResolver
 def runtime_config(**overrides) -> RuntimeConfig:  # type: ignore[no-untyped-def]
     values = {
         "provider_order": ("directml", "qnn_htp"),
+        "stt_provider_order": ("directml", "qnn_htp"),
+        "tts_provider_order": ("directml", "qnn_htp"),
         "require_npu": True,
         "directml_npu_confirmed": False,
         "directml_device_id": 0,

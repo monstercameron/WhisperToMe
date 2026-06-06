@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from whispertome.config import load_config, with_wake_phrases
+from whispertome.config import active_llm_model, load_config, with_wake_phrases
 
 
 class ConfigTests(unittest.TestCase):
@@ -33,6 +33,41 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.openai.model, "gpt-5.2")
             self.assertEqual(config.wake.phrases, ("whisper to me", "hey assistant"))
 
+    def test_can_select_cerebras_llm_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".env").write_text(
+                "\n".join(
+                    [
+                        "WHISPERTOME_LLM_PROVIDER=cerebras",
+                        "cerebras=test-key",
+                        "CEREBRAS_MODEL=gpt-oss-120b",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            old_provider = os.environ.pop("WHISPERTOME_LLM_PROVIDER", None)
+            old_key = os.environ.pop("CEREBRAS_API_KEY", None)
+            old_alias = os.environ.pop("cerebras", None)
+            try:
+                config = load_config(root, require_openai_key=True)
+            finally:
+                if old_provider is not None:
+                    os.environ["WHISPERTOME_LLM_PROVIDER"] = old_provider
+                if old_key is not None:
+                    os.environ["CEREBRAS_API_KEY"] = old_key
+                if old_alias is not None:
+                    os.environ.update({"cerebras": old_alias})
+
+            self.assertEqual(config.llm_provider, "cerebras")
+            self.assertEqual(config.cerebras.model, "gpt-oss-120b")
+            self.assertEqual(config.cerebras.base_url, "https://api.cerebras.ai/v1")
+            self.assertEqual(config.cerebras.reasoning_effort, "low")
+            self.assertEqual(config.cerebras.timeout_seconds, 20.0)
+            self.assertEqual(config.cerebras.max_retries, 0)
+            self.assertEqual(active_llm_model(config), "gpt-oss-120b")
+
     def test_can_override_wake_phrases(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = load_config(Path(tmp), require_openai_key=False)
@@ -45,6 +80,7 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             old_openai_max = os.environ.pop("OPENAI_MAX_OUTPUT_TOKENS", None)
             old_openai_model = os.environ.pop("OPENAI_MODEL", None)
+            old_llm_provider = os.environ.pop("WHISPERTOME_LLM_PROVIDER", None)
             old_stt_max = os.environ.pop("WHISPERTOME_STT_MAX_TOKENS", None)
             old_stt_variant = os.environ.pop("WHISPERTOME_STT_ONNX_VARIANT", None)
             old_stt_prompt = os.environ.pop("WHISPERTOME_STT_PROMPT", None)
@@ -58,6 +94,8 @@ class ConfigTests(unittest.TestCase):
                     os.environ["OPENAI_MAX_OUTPUT_TOKENS"] = old_openai_max
                 if old_openai_model is not None:
                     os.environ["OPENAI_MODEL"] = old_openai_model
+                if old_llm_provider is not None:
+                    os.environ["WHISPERTOME_LLM_PROVIDER"] = old_llm_provider
                 if old_stt_max is not None:
                     os.environ["WHISPERTOME_STT_MAX_TOKENS"] = old_stt_max
                 if old_stt_variant is not None:
@@ -102,6 +140,9 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("system tray", config.openai.system_prompt)
             self.assertIn("desktop capture tool", config.openai.system_prompt)
             self.assertIn("attached", config.openai.system_prompt)
+            self.assertIn("PowerShell tool", config.openai.system_prompt)
+            self.assertIn("read-only commands", config.openai.system_prompt)
+            self.assertIn("explicit confirmation", config.openai.system_prompt)
             self.assertEqual(config.stt.backend, "qai_whisper")
             self.assertEqual(config.stt.max_tokens, 64)
             self.assertEqual(config.stt.onnx_variant, "fp32")

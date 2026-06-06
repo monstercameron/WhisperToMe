@@ -12,8 +12,15 @@ from threading import Lock
 from time import perf_counter
 from typing import Any
 
-from whispertome.config import AppConfig, load_config, with_wake_phrases
+from whispertome.config import (
+    AppConfig,
+    active_llm_api_key_present,
+    active_llm_model,
+    load_config,
+    with_wake_phrases,
+)
 from whispertome.errors import WhisperToMeError
+from whispertome.llm.base import LlmResponse
 from whispertome.runtime.onnx_session import NpuOnlyOnnxSessionFactory
 from whispertome.runtime.providers import ProviderResolver
 from whispertome.stt.base import SpeechToTextModel
@@ -109,6 +116,43 @@ def _queued_interruption_command(interruption: Any | None) -> QueuedInterruption
         transcript=getattr(interruption, "transcript", ""),
         stt_wall_ms=float(getattr(interruption, "wall_ms", 0.0)),
         stt_latency_ms=float(getattr(interruption, "stt_latency_ms", 0.0)),
+    )
+
+
+def _short_exception_text(exc: BaseException, *, max_chars: int = 180) -> str:
+    text = str(exc).strip() or type(exc).__name__
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 3]}..."
+
+
+def _provider_display_name(provider: str) -> str:
+    if provider == "openai":
+        return "OpenAI"
+    return provider.capitalize()
+
+
+def _llm_turn_error_text(provider: str, exc: BaseException) -> str:
+    detail = f"{type(exc).__name__}: {exc}".lower()
+    name = _provider_display_name(provider)
+    if "429" in detail or "too many requests" in detail or "rate limit" in detail:
+        return f"{name} is rate-limiting me. Try again in a moment."
+    if "timeout" in detail or "timed out" in detail:
+        return f"{name} timed out. Try again in a moment."
+    return "I hit a model error. Try again in a moment."
+
+
+def _recoverable_llm_response(
+    config: AppConfig,
+    *,
+    started: float,
+    exc: BaseException,
+) -> LlmResponse:
+    return LlmResponse(
+        text=_llm_turn_error_text(config.llm_provider, exc),
+        latency_ms=(perf_counter() - started) * 1000.0,
+        model=active_llm_model(config),
+        response_id=None,
     )
 
 
@@ -252,7 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     demo_parser = subparsers.add_parser(
         "demo",
-        help="Run a turn-based microphone -> STT -> OpenAI -> TTS -> speaker demo.",
+        help="Run a turn-based microphone -> STT -> LLM -> TTS -> speaker demo.",
     )
     demo_parser.add_argument(
         "--record-ms",
@@ -385,7 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     test_openai_parser = subparsers.add_parser(
         "test-openai",
-        help="Send a dictation-style transcript to OpenAI through the Responses API.",
+        help="Send a dictation-style transcript to the configured LLM provider.",
     )
     test_openai_parser.add_argument("text", help="Transcript text to send.")
     test_openai_parser.add_argument(
@@ -500,11 +544,18 @@ def configure_logging(verbose: bool, log_file: Path | None, *, console: bool = T
     )
 
 
+def _print_headless_error(message: str, *, console_enabled: bool) -> None:
+    if console_enabled:
+        return
+    print(f"\nFatal error: {message}", file=sys.stderr, flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     log_file = resolve_log_file(args)
-    configure_logging(args.verbose, log_file, console=not bool(getattr(args, "tui", False)))
+    console_enabled = not bool(getattr(args, "tui", False))
+    configure_logging(args.verbose, log_file, console=console_enabled)
     if log_file is not None:
         logging.getLogger(__name__).info("log_file=%s", log_file)
 
@@ -588,9 +639,14 @@ def main(argv: list[str] | None = None) -> int:
             return run_test_openai(config, args.text, reset=args.reset)
     except WhisperToMeError as exc:
         logging.getLogger(__name__).error("%s", exc)
+        _print_headless_error(str(exc), console_enabled=console_enabled)
         return 1
     except Exception:
         logging.getLogger(__name__).exception("Unhandled failure")
+        _print_headless_error(
+            "Unhandled failure. See the log file for the traceback.",
+            console_enabled=console_enabled,
+        )
         return 1
 
     parser.error(f"Unknown command: {args.command}")
@@ -631,8 +687,11 @@ def apply_cli_overrides(config: AppConfig, args: argparse.Namespace) -> AppConfi
 def run_doctor(config: AppConfig) -> int:
     logger = logging.getLogger(__name__)
     logger.info("project_root=%s", config.project_root)
+    logger.info("llm_provider=%s", config.llm_provider)
+    logger.info("llm_api_key_present=%s", active_llm_api_key_present(config))
+    logger.info("llm_model=%s", active_llm_model(config))
     logger.info("openai_api_key_present=%s", bool(config.openai.api_key))
-    logger.info("openai_model=%s", config.openai.model)
+    logger.info("cerebras_api_key_present=%s", bool(config.cerebras.api_key))
     logger.info("wake_phrases=%s", ", ".join(config.wake.phrases))
     logger.info(
         "stt_backend=%s model_exists=%s",
@@ -666,6 +725,31 @@ def run_doctor(config: AppConfig) -> int:
     for rejection in rejections:
         logger.info("provider_rejected key=%s reason=%s", rejection.key, rejection.reason)
     logger.info("selected_provider=%s proof=%s", provider.onnx_name, provider.proof)
+    for label, order in (
+        ("stt", config.runtime.stt_provider_order),
+        ("tts", config.runtime.tts_provider_order),
+    ):
+        scoped_runtime = replace(config.runtime, provider_order=order)
+        try:
+            scoped_provider, scoped_rejections = ProviderResolver(scoped_runtime).resolve(
+                available
+            )
+        except WhisperToMeError as exc:
+            logger.error("%s_provider_check=failed order=%s reason=%s", label, order, exc)
+            return 1
+        for rejection in scoped_rejections:
+            logger.info(
+                "%s_provider_rejected key=%s reason=%s",
+                label,
+                rejection.key,
+                rejection.reason,
+            )
+        logger.info(
+            "%s_selected_provider=%s proof=%s",
+            label,
+            scoped_provider.onnx_name,
+            scoped_provider.proof,
+        )
     return 0
 
 
@@ -826,7 +910,7 @@ def run_wake_loop(
     from whispertome.audio.capture import MicrophoneInput
     from whispertome.audio.playback import SpeakerOutput
     from whispertome.audio.vad import EnergyVad, UtteranceSegmenter
-    from whispertome.llm.openai_responses import OpenAIResponder
+    from whispertome.llm.factory import build_llm_responder
     from whispertome.organizer.tools import build_organization_tool_registry, build_organizer_store
     from whispertome.system.windows import WindowsBackgroundAudioDucker
     from whispertome.text.markdown import parse_spoken_markdown
@@ -849,8 +933,8 @@ def run_wake_loop(
     ui.boot("tts adapter", config.tts.backend, 0.16)
     organizer_store = build_organizer_store(config.project_root)
     ui.boot("memory bus", "sqlite organizer and preferences", 0.22)
-    responder = OpenAIResponder(
-        config.openai,
+    responder = build_llm_responder(
+        config,
         tool_registry=build_organization_tool_registry(
             config.project_root,
             store=organizer_store,
@@ -1051,7 +1135,7 @@ def run_wake_loop(
                 )
 
             if stream_tts:
-                ui.status("streaming openai", config.openai.model)
+                ui.status(f"streaming {config.llm_provider}", active_llm_model(config))
                 chunker = SpokenTextChunker()
                 interrupt_monitor = None
                 if speaker is not None:
@@ -1096,11 +1180,34 @@ def run_wake_loop(
 
                 openai_started = perf_counter()
                 try:
-                    llm_response = responder.generate_stream(
-                        command,
-                        on_delta=on_openai_delta,
-                        on_tool_event=on_agent_tool_event,
-                    )
+                    try:
+                        llm_response = responder.generate_stream(
+                            command,
+                            on_delta=on_openai_delta,
+                            on_tool_event=on_agent_tool_event,
+                        )
+                    except Exception as exc:
+                        logger.exception(
+                            (
+                                "wake_llm_stream_failed turn=%d provider=%s model=%s "
+                                "wall_ms=%.1f error=%s"
+                            ),
+                            command_count,
+                            config.llm_provider,
+                            active_llm_model(config),
+                            (perf_counter() - openai_started) * 1000.0,
+                            _short_exception_text(exc),
+                        )
+                        ui.status(f"{config.llm_provider} error", "continuing")
+                        ui.line(
+                            f"{config.llm_provider} error: {_short_exception_text(exc)}"
+                        )
+                        llm_response = _recoverable_llm_response(
+                            config,
+                            started=openai_started,
+                            exc=exc,
+                        )
+                        on_openai_delta(llm_response.text)
                     openai_wall_ms = (perf_counter() - openai_started) * 1000.0
                     for text_chunk in chunker.finish():
                         logger.info(
@@ -1136,7 +1243,7 @@ def run_wake_loop(
                     )
                 else:
                     ui.clear_code_block()
-                ui.line(f"openai: {spoken_response.display_text}")
+                ui.line(f"{config.llm_provider}: {spoken_response.display_text}")
                 logger.info(
                     (
                         "wake_openai_stream turn=%d wall_ms=%.1f latency_ms=%.1f "
@@ -1225,12 +1332,32 @@ def run_wake_loop(
                         stream_result.chunk_count,
                     )
             else:
-                ui.status("contacting openai", config.openai.model)
+                ui.status(f"contacting {config.llm_provider}", active_llm_model(config))
                 openai_started = perf_counter()
-                llm_response = responder.generate(
-                    command,
-                    on_tool_event=on_agent_tool_event,
-                )
+                try:
+                    llm_response = responder.generate(
+                        command,
+                        on_tool_event=on_agent_tool_event,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        (
+                            "wake_llm_failed turn=%d provider=%s model=%s "
+                            "wall_ms=%.1f error=%s"
+                        ),
+                        command_count,
+                        config.llm_provider,
+                        active_llm_model(config),
+                        (perf_counter() - openai_started) * 1000.0,
+                        _short_exception_text(exc),
+                    )
+                    ui.status(f"{config.llm_provider} error", "continuing")
+                    ui.line(f"{config.llm_provider} error: {_short_exception_text(exc)}")
+                    llm_response = _recoverable_llm_response(
+                        config,
+                        started=openai_started,
+                        exc=exc,
+                    )
                 openai_wall_ms = (perf_counter() - openai_started) * 1000.0
                 spoken_response = parse_spoken_markdown(llm_response.text)
                 ui.assistant_text(spoken_response.display_text)
@@ -1245,7 +1372,7 @@ def run_wake_loop(
                     )
                 else:
                     ui.clear_code_block()
-                ui.line(f"openai: {spoken_response.display_text}")
+                ui.line(f"{config.llm_provider}: {spoken_response.display_text}")
                 logger.info(
                     (
                         "wake_openai turn=%d wall_ms=%.1f latency_ms=%.1f model=%s "
@@ -1378,6 +1505,44 @@ def run_wake_loop(
             )
             return CommandTurnResult(queued_command=queued_command)
 
+        def run_command_turn_safe(
+            command: str,
+            *,
+            utterance_index: int,
+            source: str,
+            source_transcript: str,
+            utterance_started: float,
+            stt_wall_ms: float,
+            stt_latency_ms: float,
+        ) -> CommandTurnResult:
+            try:
+                return run_command_turn(
+                    command,
+                    utterance_index=utterance_index,
+                    source=source,
+                    source_transcript=source_transcript,
+                    utterance_started=utterance_started,
+                    stt_wall_ms=stt_wall_ms,
+                    stt_latency_ms=stt_latency_ms,
+                )
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    (
+                        "wake_command_turn_failed utterance=%d source=%s command=%r "
+                        "error=%s"
+                    ),
+                    utterance_index,
+                    source,
+                    command,
+                    _short_exception_text(exc),
+                )
+                ui.status("turn error", "continuing")
+                ui.line(f"turn error: {_short_exception_text(exc)}")
+                restore_background_audio("turn_failed")
+                return CommandTurnResult()
+
         for utterance in utterances:
             if stop_requested():
                 logger.info("wake_external_stop_requested phase=before_utterance")
@@ -1465,7 +1630,7 @@ def run_wake_loop(
                 continue
 
             assert event.command is not None
-            result = run_command_turn(
+            result = run_command_turn_safe(
                 event.command,
                 utterance_index=utterance_count,
                 source="wake_loop",
@@ -1500,7 +1665,7 @@ def run_wake_loop(
                     queued.transcript,
                 )
                 ui.status("running barge-in", queued.command)
-                result = run_command_turn(
+                result = run_command_turn_safe(
                     queued.command,
                     utterance_index=utterance_count,
                     source="playback_interruption",
@@ -1571,13 +1736,13 @@ def run_demo(
         logger.info("demo_npu_only_policy=true")
 
     from whispertome.audio.playback import SpeakerOutput
-    from whispertome.llm.openai_responses import OpenAIResponder
+    from whispertome.llm.factory import build_llm_responder
     from whispertome.organizer.tools import build_organization_tool_registry, build_organizer_store
     from whispertome.text.markdown import parse_spoken_markdown
 
     organizer_store = build_organizer_store(config.project_root)
-    responder = OpenAIResponder(
-        config.openai,
+    responder = build_llm_responder(
+        config,
         tool_registry=build_organization_tool_registry(
             config.project_root,
             store=organizer_store,
@@ -2312,12 +2477,12 @@ def record_audio_buffer(sample_rate: int, duration_ms: int):
 
 def run_test_openai(config: AppConfig, text: str, *, reset: bool) -> int:
     logger = logging.getLogger(__name__)
-    from whispertome.llm.openai_responses import OpenAIResponder
+    from whispertome.llm.factory import build_llm_responder
     from whispertome.organizer.tools import build_organization_tool_registry, build_organizer_store
 
     organizer_store = build_organizer_store(config.project_root)
-    responder = OpenAIResponder(
-        config.openai,
+    responder = build_llm_responder(
+        config,
         tool_registry=build_organization_tool_registry(
             config.project_root,
             store=organizer_store,
@@ -2329,7 +2494,8 @@ def run_test_openai(config: AppConfig, text: str, *, reset: bool) -> int:
 
     def on_tool_event(event) -> None:  # type: ignore[no-untyped-def]
         logger.info(
-            "openai_agent_tool name=%s ok=%s latency_ms=%.1f args=%r output=%r",
+            "llm_agent_tool provider=%s name=%s ok=%s latency_ms=%.1f args=%r output=%r",
+            config.llm_provider,
             event.name,
             event.ok,
             event.latency_ms,
@@ -2339,7 +2505,8 @@ def run_test_openai(config: AppConfig, text: str, *, reset: bool) -> int:
 
     response = responder.generate(text, on_tool_event=on_tool_event)
     logger.info(
-        "openai_response model=%s response_id=%s latency_ms=%.1f text=%r",
+        "llm_response provider=%s model=%s response_id=%s latency_ms=%.1f text=%r",
+        config.llm_provider,
         response.model,
         response.response_id,
         response.latency_ms,

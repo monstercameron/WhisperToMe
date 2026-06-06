@@ -86,6 +86,18 @@ System control tools:
   with what they are working on, or refers to "this", "that", "the page", "the
   window", or visible desktop content that requires vision. The capture is attached
   to the model as an image and excludes the WhisperToMe window by default.
+- Use the PowerShell tool only when the user explicitly asks for local Windows
+  facts, time, environment, hardware, processes, services, installed configuration,
+  or a system check that is not covered by a narrower tool. Prefer concise,
+  read-only commands such as Get-Date, Get-ComputerInfo, Get-Process, Get-Service,
+  Test-Path, and registry/config inspection. Summarize the useful result; do not
+  read raw shell noise aloud.
+- Prefer the dedicated volume, brightness, window, desktop-capture, and organizer
+  tools over PowerShell whenever they fit the request.
+- Before running a state-changing PowerShell command, ask for explicit confirmation
+  unless the user already gave a clear direct request. Never run destructive,
+  deletion, shutdown, disk formatting, execution-policy, or arbitrary script
+  execution commands.
 - Clamp requested volume and brightness to 0-100. For vague requests like "turn it
   down", "make it louder", "dim the screen", or "brighten it", use a small relative
   change around 10 percent.
@@ -196,8 +208,23 @@ class OpenAIConfig:
 
 
 @dataclass(frozen=True)
+class CerebrasConfig:
+    api_key: str | None
+    base_url: str
+    model: str
+    system_prompt: str
+    max_output_tokens: int | None
+    stateful: bool
+    reasoning_effort: str | None
+    timeout_seconds: float
+    max_retries: int
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     provider_order: tuple[str, ...]
+    stt_provider_order: tuple[str, ...]
+    tts_provider_order: tuple[str, ...]
     require_npu: bool
     directml_npu_confirmed: bool
     directml_device_id: int
@@ -255,7 +282,9 @@ class SystemControlConfig:
 @dataclass(frozen=True)
 class AppConfig:
     project_root: Path
+    llm_provider: str
     openai: OpenAIConfig
+    cerebras: CerebrasConfig
     runtime: RuntimeConfig
     audio: AudioConfig
     stt: STTConfig
@@ -268,34 +297,90 @@ def with_wake_phrases(config: AppConfig, phrases: tuple[str, ...] | list[str]) -
     return replace(config, wake=replace(config.wake, phrases=clean_phrase_list(phrases)))
 
 
+def active_llm_model(config: AppConfig) -> str:
+    if config.llm_provider == "cerebras":
+        return config.cerebras.model
+    return config.openai.model
+
+
+def active_llm_api_key_present(config: AppConfig) -> bool:
+    if config.llm_provider == "cerebras":
+        return bool(config.cerebras.api_key)
+    return bool(config.openai.api_key)
+
+
 def load_config(project_root: Path | None = None, *, require_openai_key: bool = True) -> AppConfig:
     root = (project_root or Path.cwd()).resolve()
     load_dotenv(root / ".env")
 
+    llm_provider = (_env("WHISPERTOME_LLM_PROVIDER", "openai") or "openai").strip().lower()
+    if llm_provider not in {"openai", "cerebras"}:
+        raise ConfigError("WHISPERTOME_LLM_PROVIDER must be openai or cerebras")
+
     api_key = _env("OPENAI_API_KEY") or _env("openai")
-    if require_openai_key and not api_key:
-        raise ConfigError("OPENAI_API_KEY is missing. Put it in .env or the process environment.")
+    cerebras_api_key = _env("CEREBRAS_API_KEY") or _env("cerebras")
+    if require_openai_key:
+        if llm_provider == "openai" and not api_key:
+            raise ConfigError(
+                "OPENAI_API_KEY is missing. Put it in .env or the process environment."
+            )
+        if llm_provider == "cerebras" and not cerebras_api_key:
+            raise ConfigError(
+                "CEREBRAS_API_KEY is missing. Put it in .env or the process environment."
+            )
 
     max_output_tokens = _env_int("OPENAI_MAX_OUTPUT_TOKENS", 512)
+    cerebras_max_output_tokens = _env_int("CEREBRAS_MAX_OUTPUT_TOKENS", max_output_tokens)
+    cerebras_reasoning_effort = _env("CEREBRAS_REASONING_EFFORT", "low")
+    if cerebras_reasoning_effort not in {None, "", "low", "medium", "high"}:
+        raise ConfigError("CEREBRAS_REASONING_EFFORT must be low, medium, high, or empty")
+    cerebras_timeout_seconds = _env_float("CEREBRAS_TIMEOUT_SECONDS", 20.0)
+    if cerebras_timeout_seconds <= 0:
+        raise ConfigError("CEREBRAS_TIMEOUT_SECONDS must be greater than zero")
+    cerebras_max_retries = _env_int("CEREBRAS_MAX_RETRIES", 0)
+    if cerebras_max_retries < 0:
+        raise ConfigError("CEREBRAS_MAX_RETRIES must be zero or greater")
     stt_onnx_variant = _env("WHISPERTOME_STT_ONNX_VARIANT", "fp32") or "fp32"
     if stt_onnx_variant not in {"fp32", "int8", "auto"}:
         raise ConfigError("WHISPERTOME_STT_ONNX_VARIANT must be fp32, int8, or auto")
 
+    openai_system_prompt = (
+        _env(
+            "OPENAI_SYSTEM_PROMPT",
+            DEFAULT_OPENAI_SYSTEM_PROMPT,
+        )
+        or DEFAULT_OPENAI_SYSTEM_PROMPT
+    )
+
+    provider_order = _env_list("WHISPERTOME_PROVIDER_ORDER", ("directml", "qnn_htp"))
+
     return AppConfig(
         project_root=root,
+        llm_provider=llm_provider,
         openai=OpenAIConfig(
             api_key=api_key,
             model=_env("OPENAI_MODEL", "gpt-5.4-mini") or "gpt-5.4-mini",
-            system_prompt=_env(
-                "OPENAI_SYSTEM_PROMPT",
-                DEFAULT_OPENAI_SYSTEM_PROMPT,
-            )
-            or DEFAULT_OPENAI_SYSTEM_PROMPT,
+            system_prompt=openai_system_prompt,
             max_output_tokens=max_output_tokens,
             stateful=_env_bool("OPENAI_STATEFUL", True),
         ),
+        cerebras=CerebrasConfig(
+            api_key=cerebras_api_key,
+            base_url=_env("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1")
+            or "https://api.cerebras.ai/v1",
+            model=_env("CEREBRAS_MODEL", "gpt-oss-120b") or "gpt-oss-120b",
+            system_prompt=_env("CEREBRAS_SYSTEM_PROMPT", openai_system_prompt)
+            or openai_system_prompt,
+            max_output_tokens=cerebras_max_output_tokens,
+            stateful=_env_bool("CEREBRAS_STATEFUL", True),
+            reasoning_effort=cerebras_reasoning_effort or None,
+            timeout_seconds=cerebras_timeout_seconds,
+            max_retries=cerebras_max_retries,
+        ),
         runtime=RuntimeConfig(
-            provider_order=_env_list("WHISPERTOME_PROVIDER_ORDER", ("directml", "qnn_htp")),
+            provider_order=provider_order,
+            stt_provider_order=_env_list("WHISPERTOME_STT_PROVIDER_ORDER", provider_order),
+            tts_provider_order=_env_list("WHISPERTOME_TTS_PROVIDER_ORDER", provider_order),
             require_npu=_env_bool("WHISPERTOME_REQUIRE_NPU", True),
             directml_npu_confirmed=_env_bool("WHISPERTOME_DIRECTML_NPU_CONFIRMED", False),
             directml_device_id=_env_int("WHISPERTOME_DIRECTML_DEVICE_ID", 0),

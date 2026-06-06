@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
 from time import perf_counter
 from typing import Any
 
@@ -15,14 +14,7 @@ from whispertome.agent.tools import (
 )
 from whispertome.config import OpenAIConfig
 from whispertome.errors import ConfigError, WhisperToMeError
-
-
-@dataclass(frozen=True)
-class LlmResponse:
-    text: str
-    latency_ms: float
-    model: str
-    response_id: str | None
+from whispertome.llm.base import LlmResponse, build_dictation_user_text
 
 
 @dataclass(frozen=True)
@@ -381,27 +373,13 @@ class OpenAIResponder:
 
     @staticmethod
     def _build_input(transcript: str) -> list[dict[str, Any]]:
-        local_time = datetime.now().astimezone().replace(microsecond=0).isoformat()
         return [
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "input_text",
-                        "text": (
-                            "Speech-to-text transcript from the user. "
-                            "Interpret it as spoken dictation or a spoken command.\n\n"
-                            "Voice/TUI output contract: keep spoken prose brief. If your "
-                            "reply includes code, scripts, templates, commands, JSON, YAML, "
-                            "XML, or exact "
-                            "copyable text, put that content in a fenced markdown block after a "
-                            "short spoken lead-in so the app can display it instead of reading it "
-                            "aloud. Use at most one fenced block unless the transcript explicitly "
-                            "asks for multiple files, examples, or blocks.\n\n"
-                            f"Local date/time: {local_time}\n\n"
-                            "Transcript:\n"
-                            f"{transcript}"
-                        ),
+                        "text": build_dictation_user_text(transcript),
                     }
                 ],
             }

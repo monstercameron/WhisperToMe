@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from whispertome.audio.capture import MicrophoneInput
 from whispertome.audio.playback import SpeakerOutput
 from whispertome.audio.vad import EnergyVad, UtteranceSegmenter
-from whispertome.config import AppConfig
-from whispertome.llm.openai_responses import OpenAIResponder
+from whispertome.config import AppConfig, active_llm_model
+from whispertome.llm.base import LlmResponder
+from whispertome.llm.factory import build_llm_responder
 from whispertome.models.registry import ModelRegistry
 from whispertome.organizer.tools import build_organization_tool_registry, build_organizer_store
 from whispertome.stt.base import SpeechToTextModel
@@ -24,7 +25,7 @@ class VoiceLoopComponents:
     speaker: SpeakerOutput
     stt: SpeechToTextModel
     tts: TextToSpeechModel
-    responder: OpenAIResponder
+    responder: LlmResponder
     wake_router: WakeCommandRouter
     segmenter: UtteranceSegmenter
 
@@ -46,8 +47,8 @@ class VoiceLoop:
                 speaker=SpeakerOutput(),
                 stt=registry.create_stt(),
                 tts=registry.create_tts(),
-                responder=OpenAIResponder(
-                    config.openai,
+                responder=build_llm_responder(
+                    config,
                     tool_registry=build_organization_tool_registry(
                         config.project_root,
                         store=organizer_store,
@@ -94,9 +95,13 @@ class VoiceLoop:
             self._handle_command(event.command)
 
     def _handle_command(self, command: str) -> None:
-        LOGGER.info("sending command to OpenAI model=%s", self._config.openai.model)
+        LOGGER.info(
+            "sending command to llm provider=%s model=%s",
+            self._config.llm_provider,
+            active_llm_model(self._config),
+        )
         llm_response = self._components.responder.generate(command)
-        LOGGER.info("OpenAI response latency_ms=%.1f", llm_response.latency_ms)
+        LOGGER.info("llm response latency_ms=%.1f", llm_response.latency_ms)
         speech = self._components.tts.synthesize(llm_response.text)
         LOGGER.info(
             "tts latency_ms=%.1f provider=%s",

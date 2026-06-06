@@ -4,13 +4,14 @@ import base64
 import io
 import logging
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from time import sleep
+from time import perf_counter, sleep
 from typing import Any, Protocol
 
 from whispertome.errors import WhisperToMeError
@@ -54,6 +55,17 @@ class DesktopCaptureController(Protocol):
     ) -> DesktopCaptureResult: ...
 
 
+class PowerShellController(Protocol):
+    def run(
+        self,
+        command: str,
+        *,
+        timeout_seconds: int = 5,
+        max_output_chars: int = 4000,
+        allow_mutation: bool = False,
+    ) -> PowerShellRunResult: ...
+
+
 class AudioSessionVolume(Protocol):
     pid: int | None
     process_name: str
@@ -87,6 +99,20 @@ class DesktopCaptureResult:
     preview_height: int | None
     image_url: str | None = None
     excluded_agent_window: bool = False
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class PowerShellRunResult:
+    ok: bool
+    command: str
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    duration_ms: float
+    timed_out: bool = False
+    blocked: bool = False
+    truncated: bool = False
     reason: str | None = None
 
 
@@ -394,6 +420,93 @@ class WindowsDesktopCaptureController:
     def _capture_path(self) -> Path:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         return self._project_root / "artifacts" / "captures" / f"desktop-{stamp}.png"
+
+
+class WindowsPowerShellController:
+    """Runs short, bounded PowerShell commands for explicit local system requests."""
+
+    def run(
+        self,
+        command: str,
+        *,
+        timeout_seconds: int = 5,
+        max_output_chars: int = 4000,
+        allow_mutation: bool = False,
+    ) -> PowerShellRunResult:
+        command = command.strip()
+        timeout_seconds = min(15, max(1, int(timeout_seconds)))
+        max_output_chars = min(12000, max(200, int(max_output_chars)))
+        started = perf_counter()
+
+        reason = _blocked_powershell_reason(command, allow_mutation=allow_mutation)
+        if reason is not None:
+            return PowerShellRunResult(
+                ok=False,
+                command=command,
+                exit_code=None,
+                stdout="",
+                stderr="",
+                duration_ms=(perf_counter() - started) * 1000.0,
+                blocked=True,
+                reason=reason,
+            )
+
+        try:
+            completed = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout, stdout_truncated = _truncate_text(exc.stdout or "", max_output_chars)
+            stderr, stderr_truncated = _truncate_text(exc.stderr or "", max_output_chars)
+            return PowerShellRunResult(
+                ok=False,
+                command=command,
+                exit_code=None,
+                stdout=stdout.strip(),
+                stderr=stderr.strip(),
+                duration_ms=(perf_counter() - started) * 1000.0,
+                timed_out=True,
+                truncated=stdout_truncated or stderr_truncated,
+                reason=f"PowerShell timed out after {timeout_seconds} seconds",
+            )
+        except FileNotFoundError:
+            return PowerShellRunResult(
+                ok=False,
+                command=command,
+                exit_code=None,
+                stdout="",
+                stderr="",
+                duration_ms=(perf_counter() - started) * 1000.0,
+                reason="powershell.exe was not found",
+            )
+
+        stdout, stdout_truncated = _truncate_text(completed.stdout, max_output_chars)
+        stderr, stderr_truncated = _truncate_text(completed.stderr, max_output_chars)
+        return PowerShellRunResult(
+            ok=completed.returncode == 0,
+            command=command,
+            exit_code=completed.returncode,
+            stdout=stdout.strip(),
+            stderr=stderr.strip(),
+            duration_ms=(perf_counter() - started) * 1000.0,
+            truncated=stdout_truncated or stderr_truncated,
+            reason=None if completed.returncode == 0 else "PowerShell command failed",
+        )
 
 
 @dataclass(frozen=True)
@@ -722,6 +835,46 @@ def _run_powershell(command: str) -> str:
         error = completed.stderr.strip() or completed.stdout.strip() or "PowerShell command failed"
         raise SystemControlError(error)
     return completed.stdout.strip()
+
+
+_POWERSHELL_ALWAYS_BLOCKED = re.compile(
+    r"(?i)(?:"
+    r"\b(?:Remove-Item|rm|del|erase|rmdir|rd|Format-Volume|Clear-Disk|"
+    r"Initialize-Disk|diskpart|Restart-Computer|Stop-Computer|shutdown|"
+    r"Invoke-Expression|iex|Set-ExecutionPolicy)\b"
+    r"|(?:^|\s)reg(?:\.exe)?\s+(?:add|delete|import|restore)\b"
+    r")"
+)
+
+_POWERSHELL_MUTATION_BLOCKED = re.compile(
+    r"(?i)(?:"
+    r"\b(?:New-Item|Set-Item|Set-ItemProperty|Set-Content|Add-Content|"
+    r"Out-File|Move-Item|Copy-Item|Rename-Item|Start-Process|Stop-Process|"
+    r"Set-[A-Za-z]+|Clear-[A-Za-z]+|Export-[A-Za-z]+|Import-[A-Za-z]+|"
+    r"Enable-[A-Za-z]+|Disable-[A-Za-z]+|Install-[A-Za-z]+|Uninstall-[A-Za-z]+)\b"
+    r"|>{1,2}"
+    r")"
+)
+
+
+def _blocked_powershell_reason(command: str, *, allow_mutation: bool) -> str | None:
+    if not command:
+        return "PowerShell command cannot be empty"
+    if len(command) > 2000:
+        return "PowerShell command is too long"
+    if _POWERSHELL_ALWAYS_BLOCKED.search(command):
+        return "Command matched a blocked high-risk PowerShell pattern"
+    if not allow_mutation and _POWERSHELL_MUTATION_BLOCKED.search(command):
+        return "Command appears to mutate state; ask for explicit confirmation first"
+    return None
+
+
+def _truncate_text(text: str | bytes, max_chars: int) -> tuple[str, bool]:
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    if len(text) <= max_chars:
+        return text, False
+    return f"{text[: max_chars - 18]}\n...[truncated]...", True
 
 
 def _env_pid() -> int | None:

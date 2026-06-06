@@ -574,3 +574,26 @@ Commit: `7e3e19f` (`Milestone: initial voice assistant scaffold`)
 ### Decisions
 
 - Prefer lower latency for the spoken loop unless a task clearly needs the regular model.
+
+## Milestone 22: Provider Swap and Agent-Loop Hardening
+
+### Wins
+
+- Added a runtime-selectable LLM provider layer so the app can switch between OpenAI Responses and Cerebras Chat Completions without deleting either path.
+- Wired Cerebras `gpt-oss-120b` into the same dictation-aware system prompt, organizer tools, TUI events, and TTS flow.
+- Hardened Cerebras rate-limit behavior by disabling long SDK retries and surfacing `429` as a short spoken fallback instead of freezing the loop.
+- Added recoverable wake-turn guards so provider and tool-loop failures restore ducked audio, log the traceback, and return to listening.
+- Added a bounded `powershell_run` agent tool for explicit Windows inspection commands such as time, services, processes, and local configuration.
+- Verified the 429 fallback live: the assistant read the rate-limit message aloud and the app stayed usable.
+
+### Losses
+
+- Cerebras tool follow-up calls can still rate limit during dense agentic turns, so OpenAI remains the steadier manual-test provider for now.
+- The Cerebras path is text-only for desktop-capture tool results, while OpenAI Responses can receive the actual screenshot image.
+- Generic PowerShell access required conservative blocking and output limits; destructive or broad state-changing commands intentionally do not run through this tool.
+
+### Decisions
+
+- Fail fast on Cerebras provider errors in the voice loop instead of letting SDK retry sleeps block interruption handling.
+- Treat LLM/tool-loop errors as recoverable turn failures with short spoken feedback.
+- Prefer dedicated system tools for volume, brightness, window, and desktop capture; reserve PowerShell for explicit local inspection gaps.

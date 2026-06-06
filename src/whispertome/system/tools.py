@@ -9,17 +9,21 @@ from whispertome.agent.tools import (
     boolean_schema,
     integer_schema,
     object_schema,
+    string_schema,
 )
 from whispertome.system.windows import (
     AgentWindowController,
     BrightnessController,
     DesktopCaptureController,
     DesktopCaptureResult,
+    PowerShellController,
+    PowerShellRunResult,
     VolumeController,
     WindowActionResult,
     WindowsAgentWindowController,
     WindowsBrightnessController,
     WindowsDesktopCaptureController,
+    WindowsPowerShellController,
     WindowsVolumeController,
     clamp_percent,
 )
@@ -32,11 +36,13 @@ def build_system_control_tools(
     brightness_controller: BrightnessController | None = None,
     window_controller: AgentWindowController | None = None,
     capture_controller: DesktopCaptureController | None = None,
+    powershell_controller: PowerShellController | None = None,
 ) -> list[AgentTool]:
     volume = volume_controller or WindowsVolumeController()
     brightness = brightness_controller or WindowsBrightnessController()
     window = window_controller or WindowsAgentWindowController()
     capture = capture_controller or WindowsDesktopCaptureController(project_root=project_root)
+    powershell = powershell_controller or WindowsPowerShellController()
     return [
         _system_volume_get(volume),
         _system_volume_set(volume),
@@ -47,6 +53,7 @@ def build_system_control_tools(
         _screen_brightness_change(brightness),
         _agent_window_minimize(window),
         _desktop_capture(capture),
+        _powershell_run(powershell),
     ]
 
 
@@ -213,6 +220,45 @@ def _desktop_capture(controller: DesktopCaptureController) -> AgentTool:
     )
 
 
+def _powershell_run(controller: PowerShellController) -> AgentTool:
+    return AgentTool(
+        name="powershell_run",
+        description=(
+            "Run a short, bounded Windows PowerShell command for explicit user requests "
+            "to inspect local time, OS, hardware, process, service, environment, or "
+            "Windows configuration not covered by narrower tools. Prefer read-only "
+            "Get/Test commands. Mutating commands require allow_mutation=true after "
+            "explicit user confirmation; high-risk commands are blocked."
+        ),
+        parameters=object_schema(
+            {
+                "command": string_schema("PowerShell command to run."),
+                "timeout_seconds": integer_schema(
+                    "Command timeout in seconds, clamped from 1 to 15. Default 5.",
+                    minimum=1,
+                ),
+                "max_output_chars": integer_schema(
+                    "Maximum stdout/stderr characters returned, clamped from 200 to 12000. "
+                    "Default 4000.",
+                    minimum=200,
+                ),
+                "allow_mutation": boolean_schema(
+                    "True only when the user explicitly confirmed a state-changing command."
+                ),
+            },
+            required=["command"],
+        ),
+        handler=lambda args: _powershell_run_result(
+            controller.run(
+                str(args["command"]),
+                timeout_seconds=_positive_int(args.get("timeout_seconds"), default=5),
+                max_output_chars=_positive_int(args.get("max_output_chars"), default=4000),
+                allow_mutation=bool(args.get("allow_mutation", False)),
+            )
+        ),
+    )
+
+
 def _change_volume(controller: VolumeController, delta: Any) -> dict[str, Any]:
     current = controller.get_volume_percent()
     updated = controller.set_volume_percent(clamp_percent(current + _int_value(delta)))
@@ -270,6 +316,23 @@ def _desktop_capture_result(result: DesktopCaptureResult) -> dict[str, Any]:
                 "label": "desktop capture",
             }
         ]
+    return output
+
+
+def _powershell_run_result(result: PowerShellRunResult) -> dict[str, Any]:
+    output: dict[str, Any] = {
+        "ok": result.ok,
+        "command": result.command,
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "duration_ms": round(result.duration_ms, 1),
+        "timed_out": result.timed_out,
+        "blocked": result.blocked,
+        "truncated": result.truncated,
+    }
+    if result.reason is not None:
+        output["reason"] = result.reason
     return output
 
 
