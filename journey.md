@@ -480,3 +480,22 @@ Commit: `7e3e19f` (`Milestone: initial voice assistant scaffold`)
 - Use per-app audio-session ducking for automatic wake behavior.
 - Keep default speaker endpoint volume tools only for direct user requests like "turn the volume down."
 - Trigger ducking from interim wake detection, final wake detection, command turn start, and playback-interruption speech.
+
+## Milestone 20: TUI NPU Boot Animation
+
+### Wins
+
+- Added a dedicated full-screen TUI boot scene that covers startup until STT and TTS warmup finishes.
+- Shows a tech-style animated lattice, progress rail, and module states for config, STT, TTS, and audio readiness.
+- Keeps the normal input/output panels hidden until the voice loop is actually ready to listen.
+- Wired CLI warmup steps into explicit boot phases for adapter setup, STT loading, TTS loading, and systems-online.
+
+### Losses
+
+- Startup progress is phase-based rather than true model-load percentage because the underlying model loaders do not expose incremental progress callbacks.
+- Runs with `--no-warmup` clear the boot screen quickly because models are intentionally not loaded at startup.
+
+### Decisions
+
+- Keep the boot animation inside the existing terminal renderer instead of adding a separate splash subsystem.
+- Use ASCII-only rendering so the TUI remains stable in plain Windows terminal sessions.

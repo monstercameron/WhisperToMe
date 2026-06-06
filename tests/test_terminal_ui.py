@@ -8,6 +8,7 @@ from whispertome.ui.terminal import (
     render_code_box,
     render_frame,
     render_polygon,
+    render_progress_bar,
     status_activity_boost,
     status_marker,
     strip_ansi_len,
@@ -53,6 +54,25 @@ class TerminalUiTests(unittest.TestCase):
         self.assertIn("SCRIPT VIEW", frame)
         self.assertIn("line one", frame)
         self.assertIn("line two", frame)
+
+    def test_render_frame_uses_boot_scene_during_initialization(self) -> None:
+        state = TerminalUiState(max_lines=3)
+        state.set_boot("loading stt", "QNN Whisper session", 0.35)
+        state.set_user("hidden until ready")
+        state.set_assistant("also hidden")
+
+        frame = render_frame(state, width=100, height=34, frame=4)
+
+        self.assertIn("WHISPER TO ME // NPU BOOT", frame)
+        self.assertIn("LOADING STT", frame)
+        self.assertIn("QNN Whisper session", frame)
+        self.assertIn("35%", frame)
+        self.assertNotIn("INPUT", frame)
+        self.assertNotIn("hidden until ready", frame)
+
+    def test_boot_progress_bar_clamps_percent(self) -> None:
+        self.assertIn("100%", render_progress_bar(80, 2.0, frame=0))
+        self.assertIn("  0%", render_progress_bar(80, -1.0, frame=0))
 
     def test_code_box_reports_autoscroll_position(self) -> None:
         state = TerminalUiState(max_lines=3)

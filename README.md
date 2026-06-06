@@ -176,7 +176,7 @@ For the live terminal UI, add `--tui`:
 whispertome --project-root C:\Users\mreca\Desktop\whispertome run --allow-non-npu --save-audio --wake "computer" --speech-end-ms 1200 --tui
 ```
 
-The TUI shows a central animated polygon whose pulse follows input activity, live input/output text panels, and a bounded 1-10 line system stream for states like `listening`, `wake detected`, `transcribing`, `contacting openai`, `running tts`, and `playing speech`. UI state changes wake the renderer immediately so wake/interruption animations do not wait for the next fixed tick. Use `--tui-lines 6` to change the stream height.
+The TUI opens with a full-screen NPU boot animation while the local STT and TTS models warm up. Once the voice stack is ready, it switches to the normal central animated polygon whose pulse follows input activity, live input/output text panels, and a bounded 1-10 line system stream for states like `listening`, `wake detected`, `transcribing`, `contacting openai`, `running tts`, and `playing speech`. UI state changes wake the renderer immediately so wake/interruption animations do not wait for the next fixed tick. Use `--tui-lines 6` to change the stream height.
 
 When the TUI is enabled, the wake loop also runs an interim wake preview during active speech. This is not true Whisper token streaming; the local Whisper/QNN path is still batch STT. Instead, the app periodically transcribes a rolling audio window while the user is still speaking and uses that interim transcript only to update the TUI wake state sooner. The final pause-delimited transcript remains the source of truth for command execution.
 
@@ -355,7 +355,7 @@ Implemented:
 - `test-openai` command for Responses API smoke tests.
 - `demo` command for microphone -> STT -> OpenAI -> TTS -> speaker conversation testing with per-run logs.
 - `run` command for the continuous wake phrase loop with per-run logs and optional utterance audio capture.
-- Optional `run --tui` terminal UI with central polygon animation, input/output text, and a bounded system state stream.
+- Optional `run --tui` terminal UI with a startup NPU boot animation, central polygon animation, input/output text, and a bounded system state stream.
 - Markdown-aware TTS text preparation that suppresses fenced and obvious unfenced code blocks and renders script/code blocks in the TUI.
 - Interruptible assistant playback with concurrent STT wake detection during spoken output.
 - Streaming OpenAI deltas into sentence-level TTS chunks for lower perceived assistant latency.

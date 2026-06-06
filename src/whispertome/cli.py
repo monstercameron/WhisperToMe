@@ -657,13 +657,17 @@ def run_wake_loop(
 
     ui = TerminalVoiceUi(max_lines=tui_lines) if use_tui else NullVoiceUi()
     ui.start()
+    ui.boot("runtime graph", "building local voice adapters", 0.03)
     stt_model = prepare_stt_model(config, allow_non_npu=allow_non_npu)
+    ui.boot("stt adapter", config.stt.backend, 0.10)
     tts_model = prepare_tts_model(
         config,
         allow_non_npu=allow_non_npu,
         prefer_debug_non_npu=allow_non_npu,
     )
+    ui.boot("tts adapter", config.tts.backend, 0.16)
     organizer_store = build_organizer_store(config.project_root)
+    ui.boot("memory bus", "sqlite organizer and preferences", 0.22)
     responder = OpenAIResponder(
         config.openai,
         tool_registry=build_organization_tool_registry(
@@ -728,15 +732,20 @@ def run_wake_loop(
         if warmup:
             warmup_started = perf_counter()
             logger.info("wake_warmup_started")
-            ui.status("warming models", "QNN STT and TTS voice")
+            ui.boot("loading stt", "QNN Whisper session", 0.35)
             stt_model.load()
+            ui.boot("loading tts", "Kokoro voice session", 0.70)
             tts_model.load()
             warmup_ms = (perf_counter() - warmup_started) * 1000.0
             logger.info(
                 "wake_warmup_complete latency_ms=%.1f",
                 warmup_ms,
             )
+            ui.boot("systems online", f"warmup {warmup_ms:.0f} ms", 1.0)
+            ui.boot_complete()
             ui.status("listening", f"warmup {warmup_ms:.0f} ms")
+        else:
+            ui.boot_complete()
 
         audio_dir = config.project_root / "artifacts" / "wake" / datetime.now().strftime(
             "%Y%m%d-%H%M%S"

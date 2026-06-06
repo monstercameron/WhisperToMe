@@ -31,6 +31,12 @@ class NullVoiceUi:
     def status(self, text: str, detail: str = "") -> None:
         return
 
+    def boot(self, phase: str, detail: str = "", progress: float = 0.0) -> None:
+        return
+
+    def boot_complete(self) -> None:
+        return
+
     def line(self, text: str) -> None:
         return
 
@@ -60,6 +66,10 @@ class TerminalUiState:
     code_language: str = ""
     code_text: str = ""
     activity_value: float = 0.0
+    boot_active: bool = False
+    boot_phase: str = "initializing"
+    boot_detail: str = ""
+    boot_progress: float = 0.0
     stream_lines: deque[str] = field(default_factory=deque)
 
     def __post_init__(self) -> None:
@@ -70,6 +80,20 @@ class TerminalUiState:
         self.status_text = text.strip() or "idle"
         self.status_detail = detail.strip()
         self.add_line(self.status_text if not detail else f"{self.status_text} - {detail}")
+
+    def set_boot(self, phase: str, detail: str = "", progress: float = 0.0) -> None:
+        self.boot_active = True
+        self.boot_phase = phase.strip() or "initializing"
+        self.boot_detail = detail.strip()
+        self.boot_progress = max(0.0, min(1.0, float(progress)))
+        line_detail = f" - {self.boot_detail}" if self.boot_detail else ""
+        self.add_line(f"init {self.boot_phase}{line_detail}")
+
+    def clear_boot(self) -> None:
+        self.boot_active = False
+        self.boot_phase = ""
+        self.boot_detail = ""
+        self.boot_progress = 0.0
 
     def set_user(self, text: str) -> None:
         self.user = text.strip()
@@ -103,6 +127,10 @@ class TerminalUiState:
             code_language=self.code_language,
             code_text=self.code_text,
             activity_value=self.activity_value,
+            boot_active=self.boot_active,
+            boot_phase=self.boot_phase,
+            boot_detail=self.boot_detail,
+            boot_progress=self.boot_progress,
             stream_lines=deque(self.stream_lines, maxlen=self.max_lines),
         )
 
@@ -146,6 +174,16 @@ class TerminalVoiceUi:
     def status(self, text: str, detail: str = "") -> None:
         with self._lock:
             self._state.set_status(text, detail)
+        self._request_render()
+
+    def boot(self, phase: str, detail: str = "", progress: float = 0.0) -> None:
+        with self._lock:
+            self._state.set_boot(phase, detail, progress)
+        self._request_render()
+
+    def boot_complete(self) -> None:
+        with self._lock:
+            self._state.clear_boot()
         self._request_render()
 
     def line(self, text: str) -> None:
@@ -204,6 +242,9 @@ class TerminalVoiceUi:
 def render_frame(state: TerminalUiState, *, width: int, height: int, frame: int) -> str:
     width = max(60, width)
     available_height = max(24, height)
+    if state.boot_active:
+        return render_boot_frame(state, width=width, height=available_height, frame=frame)
+
     content_width = min(width - 4, 112)
     polygon_width = min(58, content_width)
     has_code = bool(state.code_text)
@@ -241,6 +282,136 @@ def render_frame(state: TerminalUiState, *, width: int, height: int, frame: int)
         lines.append("")
     lines.extend(render_stream(state, content_width))
     return "\n".join(lines[:available_height]) + "\n"
+
+
+def render_boot_frame(
+    state: TerminalUiState,
+    *,
+    width: int,
+    height: int,
+    frame: int,
+) -> str:
+    width = max(60, width)
+    available_height = max(24, height)
+    content_width = min(width - 4, 104)
+    phase = state.boot_phase or "initializing"
+    detail = state.boot_detail or "loading local voice stack"
+    progress = max(0.0, min(1.0, state.boot_progress))
+    shimmer = ["-", "\\", "|", "/"][frame % 4]
+
+    lines: list[str] = []
+    lines.append(center(f"{BOLD}{CYAN}WHISPER TO ME // NPU BOOT{RESET}", width))
+    lines.append(center(f"{DIM}LOCAL VOICE RUNTIME HANDSHAKE {shimmer}{RESET}", width))
+    lines.append("")
+    lines.extend(
+        center(line, width)
+        for line in render_boot_lattice(
+            min(70, content_width),
+            13 if available_height >= 32 else 11,
+            frame=frame,
+            progress=progress,
+        )
+    )
+    lines.append("")
+    phase_line = f"{BOLD}{WHITE}{phase.upper()}{RESET} {DIM}{detail}{RESET}"
+    lines.append(center(phase_line, width))
+    lines.append(center(render_progress_bar(content_width, progress, frame=frame), width))
+    lines.append("")
+    lines.extend(center(line, width) for line in render_boot_modules(progress, content_width))
+    if state.stream_lines and available_height >= 32:
+        lines.append("")
+        lines.append(center(f"{BOLD}{WHITE}BOOT STREAM{RESET}", width))
+        for item in list(state.stream_lines)[-4:]:
+            lines.append(center(f"{DIM}> {item}{RESET}", width))
+    return "\n".join(lines[:available_height]) + "\n"
+
+
+def render_boot_lattice(
+    width: int,
+    height: int,
+    *,
+    frame: int,
+    progress: float,
+) -> list[str]:
+    width = max(38, width)
+    height = max(9, height)
+    grid = [[" " for _ in range(width)] for _ in range(height)]
+    cx = (width - 1) / 2.0
+    cy = (height - 1) / 2.0
+    outer = min(width / 4.3, height / 1.85)
+    phase = frame * 0.11
+    progress_angle = progress * math.tau
+
+    for y in range(height):
+        for x in range(width):
+            dx = (x - cx) / 2.1
+            dy = y - cy
+            radius = math.sqrt(dx * dx + dy * dy)
+            angle = (math.atan2(dy, dx) + math.tau) % math.tau
+            moving_angle = (angle + phase) % math.tau
+            ring = min(
+                abs(radius - outer),
+                abs(radius - outer * 0.66),
+                abs(radius - outer * 0.34),
+            )
+            spoke = abs(math.sin(moving_angle * 4.0)) < 0.045 and radius < outer * 0.98
+            arc = abs(radius - outer) < 0.16 and angle <= progress_angle
+
+            if arc:
+                grid[y][x] = "#"
+            elif ring < 0.10:
+                grid[y][x] = "+" if (x + y + frame) % 5 == 0 else "."
+            elif spoke:
+                grid[y][x] = "*"
+
+    put(grid, round(cx), round(cy), "@")
+    put(grid, round(cx) - 1, round(cy), "[")
+    put(grid, round(cx) + 1, round(cy), "]")
+    scan_y = int((frame * 0.35) % height)
+    for x in range(3, width - 3, 5):
+        if grid[scan_y][x] == " ":
+            grid[scan_y][x] = "."
+    return [CYAN + "".join(row).rstrip() + RESET for row in grid]
+
+
+def render_progress_bar(width: int, progress: float, *, frame: int) -> str:
+    progress = max(0.0, min(1.0, progress))
+    inner = max(24, min(64, width - 18))
+    filled = min(inner, max(0, round(inner * progress)))
+    head = ">" if frame % 2 == 0 else "="
+    if filled <= 0:
+        body = "." * inner
+    elif filled >= inner:
+        body = "#" * inner
+    else:
+        body = "#" * (filled - 1) + head + "." * (inner - filled)
+    percent = f"{round(progress * 100):3d}%"
+    return f"{GREEN}[{body}]{RESET} {BOLD}{percent}{RESET}"
+
+
+def render_boot_modules(progress: float, width: int) -> list[str]:
+    modules = [
+        ("CONFIG", 0.08, "env and runtime policy"),
+        ("STT", 0.45, "QNN Whisper session"),
+        ("TTS", 0.78, "Kokoro voice session"),
+        ("AUDIO", 0.92, "mic, speaker, session ducking"),
+    ]
+    columns = []
+    for name, threshold, detail in modules:
+        if progress >= threshold:
+            marker = GREEN + "ONLINE " + RESET
+        elif progress >= max(0.0, threshold - 0.24):
+            marker = YELLOW + "SYNC   " + RESET
+        else:
+            marker = DIM + "WAIT   " + RESET
+        columns.append(f"{marker}{BOLD}{name:<6}{RESET} {DIM}{detail}{RESET}")
+
+    if width >= 92:
+        return [
+            f"{columns[0]}    {columns[1]}",
+            f"{columns[2]}    {columns[3]}",
+        ]
+    return columns
 
 
 def render_polygon(
