@@ -16,7 +16,11 @@ Say `computer`, keep talking, and WhisperToMe handles the rest.
 - It stores notes, preferences, reminders, tasks, checklists, itinerary items, projects, decisions, and people notes in SQLite.
 - It can answer "what is up next?" from local time-sensitive organizer data.
 - It can adjust Windows volume, duck other apps, change brightness, minimize itself to the tray, run guarded PowerShell commands, and capture the desktop for visual context.
-- It ships with a desktop-hosted TUI: central animated polygon, live input/output panes, status stream, code/script viewport, startup animation, tray menu, and wake-triggered restore.
+- It can switch to other open windows ("switch to Chrome") and open web searches, maps, and sites in the browser.
+- It schedules future events and reminders that fire on their own — at a time or on a recurrence — to speak a reminder or run a recorded tool workflow autonomously.
+- It auto-compacts the conversation after an idle hour or when context fills up (a Codex-style, cache-aware threshold), keeping replies fast over long sessions.
+- It runs speech on the Snapdragon NPU: both Whisper STT and Supertonic TTS execute on the Hexagon NPU through ONNX Runtime QNN.
+- It ships with a desktop-hosted TUI: central animated polygon, voice-reactive waveform, a live "next up" agenda chip, input/output panes, status stream, code/script viewport, startup animation, tray menu, and wake-triggered restore.
 
 ## Why It Is Fun
 
@@ -41,14 +45,15 @@ src/whispertome/
   llm/        OpenAI and Cerebras provider adapters
   models/     model registry and runtime wiring
   organizer/  SQLite-backed memory and planning tools
-  runtime/    NPU-only provider selection
-  stt/        Whisper adapters
-  tts/        Kokoro adapters and speech preparation
+  runtime/    NPU-only provider selection + async runtime event bus
+  scheduler/  in-process scheduled events that fire (reminders + recorded workflows)
+  stt/        Whisper adapters (Qualcomm QNN Whisper-Small runs on the NPU)
+  tts/        Kokoro + Supertonic adapters (Supertonic runs on the NPU)
   tui/        animated terminal UI
   wake/       wake phrase detection and command routing
 ```
 
-The production policy is still strict: local AI inference should run on verified NPU paths, with no quiet CPU or GPU fallback. During feature development, explicit debug flags can bypass that policy so the voice loop, UI, tools, and LLM behavior can be tested while NPU TTS artifacts are still being researched.
+The production policy is still strict: local AI inference runs on verified NPU paths, with no quiet CPU or GPU fallback. Both halves of the speech stack now meet it — Whisper STT and Supertonic TTS run on the Hexagon NPU via QNN HTP. Explicit debug flags can still bypass the policy (e.g. Kokoro on CPU) for voice-quality testing.
 
 ## Quick Start
 
@@ -56,11 +61,13 @@ Developer setup, environment variables, model paths, live commands, desktop host
 
 [Getting Started](docs/GETTING_STARTED.md)
 
-The shortest current desktop dev run is:
+The shortest current desktop dev run is now fully NPU (STT + Supertonic TTS), no debug flag:
 
 ```powershell
-whispertome --project-root C:\Users\mreca\Desktop\whispertome desktop --allow-non-npu --save-audio --wake "computer" --speech-end-ms 1200
+whispertome --project-root C:\Users\mreca\Desktop\whispertome desktop --wake "computer"
 ```
+
+Add `--allow-non-npu` only to fall back to the Kokoro CPU debug voice.
 
 Use `--show-console` only when debugging the desktop host itself. Normal desktop mode should show the WhisperToMe window and tray icon without extra console windows.
 
@@ -79,7 +86,7 @@ Project history and research notes were moved out of the root so the README can 
 - [Journey](research/journey.md)
 - [Notes](research/notes.md)
 
-The active TTS/NPU research thread is still tracked there. In short: Kokoro is the preferred local voice target, but the current stock ONNX export is blocked on dynamic-shape support for the Snapdragon/QNN NPU path. Debug TTS remains available for building the product loop while the proper NPU artifact is worked out.
+The TTS/NPU research thread resolved to a working NPU voice: **Supertonic** runs end-to-end on the Hexagon NPU (~10x realtime) by static-fixing the source ONNX and compiling fresh on-device. Kokoro stays as a CPU debug voice — its stock export is blocked on QNN dynamic shapes and a correct static export needs an attention-mask re-export (no ARM64 Windows PyTorch wheel). Details and the full milestone log are in the journey.
 
 ## North Star
 

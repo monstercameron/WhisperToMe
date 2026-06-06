@@ -52,6 +52,19 @@ WHISPERTOME_WAKE_PHRASES=computer
 WHISPERTOME_SPEECH_END_MS=1200
 WHISPERTOME_WAKE_DUCK_VOLUME=true
 WHISPERTOME_WAKE_DUCK_VOLUME_PERCENT=25
+
+# TTS: supertonic (NPU, default) or kokoro_onnx (CPU debug voice)
+WHISPERTOME_TTS_BACKEND=supertonic
+WHISPERTOME_SUPERTONIC_VOICE=M1
+WHISPERTOME_SUPERTONIC_SPEED=1.15
+
+# Scheduled events / reminders (in-process firing)
+WHISPERTOME_SCHEDULER_ENABLED=true
+
+# Auto-compaction: idle (1h) + usage threshold (Codex-style, cache-aware)
+WHISPERTOME_IDLE_COMPACT_SECONDS=3600
+WHISPERTOME_CONTEXT_WINDOW_TOKENS=128000
+WHISPERTOME_COMPACT_THRESHOLD_PCT=0.75
 ```
 
 The app reads `.env` automatically. It only reports whether a key is present; it does not print secrets.
@@ -73,14 +86,14 @@ encoder_qairt_context.bin
 decoder_qairt_context.bin
 ```
 
-The current TTS target is Kokoro:
+The default TTS is **Supertonic**, which runs on the Hexagon NPU. Its source ONNX stages live under:
 
 ```text
-models/kokoro/kokoro-v1.0.onnx
-models/kokoro/voices-v1.0.bin
+models/supertonic2/model/onnx/        (text_encoder, duration_predictor, vector_estimator, vocoder + tts.json, unicode_indexer.json)
+models/supertonic2/model/voice_styles/  (M1.json, F1.json, ...)
 ```
 
-The stock Kokoro ONNX export is still blocked for strict Snapdragon/QNN NPU execution because QNN rejects dynamic shapes. Use explicit debug non-NPU mode only while developing the voice loop and UI.
+On first run the adapter static-fixes the source ONNX and compiles QNN HTP context binaries into `artifacts/supertonic_static/` (one-time ~20s warmup; later loads are fast). Set `WHISPERTOME_TTS_BACKEND=kokoro_onnx` (with `--allow-non-npu`) to use the Kokoro CPU debug voice instead — Kokoro's stock ONNX is still blocked on strict QNN HTP (dynamic shapes).
 
 ## Runtime Policy
 

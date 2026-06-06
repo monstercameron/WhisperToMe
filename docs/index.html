@@ -27,9 +27,9 @@
           <p class="eyebrow">Snapdragon X2 Elite voice rig</p>
           <h1>A 24/7 assistant for Snapdragon desktops.</h1>
           <p class="lede">
-            WhisperToMe is being tuned for an always-on Windows background loop:
-            local Whisper STT on the Snapdragon NPU, low-latency model calls,
-            local TTS goals, desktop controls, and a cockpit UI that shows every
+            WhisperToMe is an always-on Windows background loop: local Whisper STT
+            and Supertonic TTS both on the Snapdragon NPU, low-latency model calls,
+            scheduled events, desktop controls, and a cockpit UI that shows every
             stage of the conversation.
           </p>
           <div class="actions">
@@ -98,6 +98,22 @@
         </article>
       </section>
 
+      <section class="section screenshot-section" id="screenshot">
+        <div class="section-heading">
+          <p class="eyebrow">The real window</p>
+          <h2>What you actually see.</h2>
+        </div>
+        <figure class="app-shot">
+          <img src="screenshot.png" loading="lazy"
+            alt="WhisperToMe desktop window showing the animated pipeline polygon, live transcript and assistant panes, the system stream, and a listening status bar." />
+          <figcaption>
+            The desktop window, live: Whisper STT and Supertonic TTS on the NPU, the
+            STT &rarr; LLM &rarr; tools &rarr; TTS pipeline, the central activity polygon,
+            transcript and assistant panes, the system stream, and the listening status bar.
+          </figcaption>
+        </figure>
+      </section>
+
       <section class="section">
         <div class="section-heading">
           <p class="eyebrow">What it does</p>
@@ -109,8 +125,8 @@
             <p>Continuous microphone capture, VAD segmentation, sliding wake phrase detection, and speech-pause command capture.</p>
           </article>
           <article>
-            <h3>Local speech first</h3>
-            <p>Whisper STT runs through modular backends with a strict no CPU/GPU fallback policy for production local inference.</p>
+            <h3>Speech on the NPU</h3>
+            <p>Whisper STT and Supertonic TTS both run on the Snapdragon Hexagon NPU via ONNX Runtime QNN, with a strict no CPU/GPU fallback policy.</p>
           </article>
           <article>
             <h3>Fast model swaps</h3>
@@ -126,7 +142,15 @@
           </article>
           <article>
             <h3>Windows-aware</h3>
-            <p>Tray behavior, volume ducking, brightness and volume tools, desktop capture, and guarded PowerShell commands.</p>
+            <p>Tray behavior, volume ducking, brightness and volume tools, desktop capture, guarded PowerShell, switch-to-window, and one-shot web search/maps in the browser.</p>
+          </article>
+          <article>
+            <h3>Schedules the future</h3>
+            <p>Reminders and event triggers that fire on their own at a time or recurrence &mdash; speak a reminder or replay a recorded tool workflow autonomously, with a live "next up" chip in the UI.</p>
+          </article>
+          <article>
+            <h3>Stays efficient</h3>
+            <p>Auto-compacts the conversation after an idle hour or when context fills (a Codex-style, cache-aware threshold), and idles the UI render loop to save power.</p>
           </article>
         </div>
       </section>
@@ -173,6 +197,16 @@
             <h3>Gave it local memory</h3>
             <p>Added SQLite tools for notes, preferences, reminders, checklists, itinerary, tasks, projects, decisions, people, and time-sensitive up-next checks.</p>
           </article>
+          <article>
+            <span>07</span>
+            <h3>Put TTS on the NPU</h3>
+            <p>Brought Supertonic text-to-speech onto the Hexagon NPU end-to-end (~10x realtime) with frame-bucketing and on-device context caching, so both STT and TTS run off the CPU.</p>
+          </article>
+          <article>
+            <span>08</span>
+            <h3>Made it autonomous over time</h3>
+            <p>Added scheduled events and reminders that fire on their own, switch-to-window and browser actions, and idle + usage-based auto-compaction to keep long sessions fast.</p>
+          </article>
         </div>
       </section>
 
@@ -193,15 +227,15 @@
           </article>
           <article class="good">
             <b>Proven</b>
-            <p>Qualcomm AI Hub Whisper-Small is the current production STT candidate for Snapdragon X2 Elite.</p>
+            <p>Qualcomm AI Hub Whisper-Small is the production STT path on Snapdragon X2 Elite.</p>
+          </article>
+          <article class="good">
+            <b>Proven</b>
+            <p>Supertonic TTS now runs end-to-end on the Hexagon NPU (~10x realtime) by static-fixing the source ONNX and compiling fresh on-device &mdash; both halves of the speech stack are on the NPU.</p>
           </article>
           <article class="warning">
-            <b>Blocked</b>
-            <p>Stock Kokoro ONNX fails strict QNN HTP initialization because dynamic internal shapes are rejected.</p>
-          </article>
-          <article class="warning">
-            <b>Blocked</b>
-            <p>Freezing public token length was not enough; a proper static-shape or compatible QNN-context TTS artifact is still needed.</p>
+            <b>Workaround</b>
+            <p>Stock Kokoro ONNX still fails strict QNN HTP (dynamic shapes); a correct static export needs an attention-mask re-export, so Kokoro stays as a CPU debug voice.</p>
           </article>
         </div>
       </section>
@@ -231,9 +265,9 @@
         <p>
           Wake phrase, animated TUI, tray-hosted window, audio ducking, organizer
           tools, desktop capture, OpenAI/Cerebras switching, and interruption
-          handling are in place. Next frontier: a fully NPU-safe local TTS path
-          for the Snapdragon X2 Elite target so the 24/7 loop can stay efficient
-          all day.
+          handling are in place, and both Whisper STT and Supertonic TTS now run
+          on the Hexagon NPU. Next frontier: OS-level wake so scheduled events can
+          fire even when the app is closed, and a richer native desktop shell.
         </p>
       </section>
     </main>
