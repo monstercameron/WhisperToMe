@@ -25,6 +25,7 @@ def build_organization_tool_registry(
     project_root: Path,
     *,
     store: OrganizerStore | None = None,
+    extra_tools: list | None = None,
 ) -> AgentToolRegistry:
     active_store = store or build_organizer_store(project_root)
     return AgentToolRegistry(
@@ -57,6 +58,7 @@ def build_organization_tool_registry(
             _people_list(active_store),
             _organization_summary(active_store),
             *build_system_control_tools(project_root=project_root),
+            *(extra_tools or []),
         ]
     )
 

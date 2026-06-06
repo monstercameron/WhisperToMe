@@ -23,14 +23,22 @@ class ConfigTests(unittest.TestCase):
             )
 
             old_key = os.environ.pop("OPENAI_API_KEY", None)
+            old_provider = os.environ.pop("WHISPERTOME_LLM_PROVIDER", None)
+            old_model = os.environ.pop("OPENAI_MODEL", None)
             try:
                 config = load_config(root, require_openai_key=False)
             finally:
                 if old_key is not None:
                     os.environ["OPENAI_API_KEY"] = old_key
+                if old_provider is not None:
+                    os.environ["WHISPERTOME_LLM_PROVIDER"] = old_provider
+                if old_model is not None:
+                    os.environ["OPENAI_MODEL"] = old_model
 
             self.assertIsNone(config.openai.api_key)
+            self.assertEqual(config.llm_provider, "openai")
             self.assertEqual(config.openai.model, "gpt-5.2")
+            self.assertEqual(active_llm_model(config), "gpt-5.2")
             self.assertEqual(config.wake.phrases, ("whisper to me", "hey assistant"))
 
     def test_can_select_cerebras_llm_provider(self) -> None:

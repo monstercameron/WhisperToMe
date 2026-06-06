@@ -263,6 +263,10 @@ class TTSConfig:
     language: str
     speed: float
     sample_rate: int
+    supertonic_dir: Path
+    supertonic_voice: str
+    diffusion_steps: int
+    supertonic_speed: float
 
 
 @dataclass(frozen=True)
@@ -414,7 +418,7 @@ def load_config(project_root: Path | None = None, *, require_openai_key: bool = 
             prompt=_env("WHISPERTOME_STT_PROMPT", DEFAULT_STT_PROMPT) or DEFAULT_STT_PROMPT,
         ),
         tts=TTSConfig(
-            backend=_env("WHISPERTOME_TTS_BACKEND", "kokoro_onnx") or "kokoro_onnx",
+            backend=_env("WHISPERTOME_TTS_BACKEND", "supertonic") or "supertonic",
             model_path=_env_path(
                 "WHISPERTOME_TTS_MODEL_PATH",
                 root,
@@ -429,6 +433,16 @@ def load_config(project_root: Path | None = None, *, require_openai_key: bool = 
             language=_env("WHISPERTOME_TTS_LANGUAGE", "en-us") or "en-us",
             speed=_env_float("WHISPERTOME_TTS_SPEED", 1.0),
             sample_rate=_env_int("WHISPERTOME_TTS_SAMPLE_RATE", 24000),
+            supertonic_dir=_env_path(
+                "WHISPERTOME_SUPERTONIC_DIR",
+                root,
+                "models/supertonic2",
+            ),
+            supertonic_voice=_env("WHISPERTOME_SUPERTONIC_VOICE", "M1") or "M1",
+            diffusion_steps=_env_int("WHISPERTOME_SUPERTONIC_STEPS", 10),
+            # >1.0 speaks faster (Supertonic divides predicted duration by speed). 1.15
+            # tightens the default pacing, which sounds noticeably less sluggish/slurred.
+            supertonic_speed=_env_float("WHISPERTOME_SUPERTONIC_SPEED", 1.15),
         ),
         wake=WakeConfig(
             phrases=clean_phrase_list(_env_list("WHISPERTOME_WAKE_PHRASES", ("whisper to me",))),

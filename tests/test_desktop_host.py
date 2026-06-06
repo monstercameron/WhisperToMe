@@ -11,6 +11,7 @@ from whispertome.desktop.host import (
     _estimate_tui_viewport,
     _latest_terminal_frame,
     _load_window_placement,
+    _measure_tui_viewport,
     _save_window_placement,
     build_voice_loop_command,
 )
@@ -137,7 +138,68 @@ def test_latest_terminal_frame_keeps_incremental_output() -> None:
 
 
 def test_estimate_tui_viewport_targets_800_by_600_shell() -> None:
-    assert _estimate_tui_viewport(800, 600, 10) == (87, 29)
+    assert _estimate_tui_viewport(800, 600, 10) == (82, 26)
+
+
+class _FakeTerminal:
+    def __init__(self, *, width: int, height: int, padx: int = 10, pady: int = 8) -> None:
+        self._width = width
+        self._height = height
+        self._padx = padx
+        self._pady = pady
+
+    def update_idletasks(self) -> None:
+        return
+
+    def winfo_width(self) -> int:
+        return self._width
+
+    def winfo_height(self) -> int:
+        return self._height
+
+    def cget(self, key: str) -> int:
+        if key == "padx":
+            return self._padx
+        if key == "pady":
+            return self._pady
+        raise KeyError(key)
+
+
+class _FakeFont:
+    def measure(self, text: str) -> int:
+        return 8
+
+    def metrics(self, key: str) -> int:
+        if key == "linespace":
+            return 16
+        raise KeyError(key)
+
+
+def test_measured_tui_viewport_expands_to_actual_terminal_area() -> None:
+    assert _measure_tui_viewport(
+        _FakeTerminal(width=800, height=552, padx=4, pady=0),
+        _FakeFont(),
+        fallback_columns=82,
+        fallback_rows=26,
+    ) == (99, 34)
+
+
+def test_measured_tui_viewport_uses_real_area_without_forcing_fallback() -> None:
+    assert _measure_tui_viewport(
+        _FakeTerminal(width=640, height=420, padx=4, pady=0),
+        _FakeFont(),
+        fallback_columns=82,
+        fallback_rows=26,
+    ) == (79, 26)
+
+
+def test_measured_tui_viewport_falls_back_without_widget() -> None:
+    assert _measure_tui_viewport(
+        None,
+        None,
+        fallback_columns=82,
+        fallback_rows=26,
+    ) == (82, 26)
 
 
 def test_center_placement_targets_screen_middle() -> None:

@@ -5,6 +5,7 @@ import unittest
 from whispertome.ui.terminal import (
     RESET,
     TerminalUiState,
+    display_text,
     render_code_box,
     render_frame,
     render_polygon,
@@ -89,6 +90,65 @@ class TerminalUiTests(unittest.TestCase):
         self.assertTrue(all(strip_ansi_len(line) <= 87 for line in lines))
         self.assertIn("SCRIPT VIEW", frame)
         self.assertIn("SYSTEM STREAM", frame)
+
+    def test_compact_runtime_keeps_all_pipeline_steps_visible(self) -> None:
+        state = TerminalUiState(max_lines=3)
+        state.set_status("playing speech", "tts")
+
+        frame = render_frame(state, width=87, height=29, frame=24)
+
+        self.assertIn("1) STT", frame)
+        self.assertIn("2) LLM", frame)
+        self.assertIn("3) TOOLS", frame)
+        self.assertIn("4) TTS", frame)
+        self.assertIn(status_marker("playing speech"), frame)
+
+    def test_code_view_stays_pinned_to_first_line(self) -> None:
+        state = TerminalUiState(max_lines=3)
+        state.set_code_block("script", "\n".join(f"line {index}" for index in range(20)))
+
+        frame = render_frame(state, width=87, height=29, frame=96)
+
+        self.assertIn(" 1 ", frame)
+        self.assertIn("line 0", frame)
+        self.assertNotIn("13-20/20", frame)
+
+    def test_compact_footer_keeps_stop_hint_visible(self) -> None:
+        state = TerminalUiState(max_lines=3)
+        state.set_status("contacting openai", "gpt-5.5-mini")
+
+        frame = render_frame(state, width=87, height=29, frame=1)
+
+        self.assertIn("CTRL+C to stop", frame)
+
+    def test_display_text_replaces_unsupported_unicode(self) -> None:
+        self.assertEqual(display_text("low\u2011carb and it\u2019s fine"), "low-carb and it's fine")
+
+    def test_frame_with_unicode_model_text_is_ascii_encodable(self) -> None:
+        state = TerminalUiState(max_lines=3)
+        state.set_status("streaming cerebras", "gpt-oss-120b")
+        state.set_assistant("It\u2019s low\u2011carb, satisfying, and friendly.")
+
+        frame = render_frame(state, width=82, height=26, frame=5)
+
+        frame.encode("ascii")
+        self.assertIn("It's low-carb", frame)
+
+    def test_render_frame_fits_safer_800_by_600_desktop_viewport(self) -> None:
+        state = TerminalUiState(max_lines=10)
+        state.set_status("streaming cerebras", "gpt-oss-120b")
+        state.set_user("Computer, help me plan the next big upgrade and keep it short.")
+        state.set_assistant("Let's make the desktop shell feel tighter and faster.")
+        for index in range(10):
+            state.add_line(f"event {index}")
+
+        frame = render_frame(state, width=82, height=26, frame=8)
+        lines = frame.splitlines()
+
+        self.assertLessEqual(len(lines), 26)
+        self.assertTrue(all(strip_ansi_len(line) <= 82 for line in lines))
+        self.assertIn("4) TTS", frame)
+        self.assertIn("CTRL+C to stop", frame)
 
     def test_render_frame_uses_boot_scene_during_initialization(self) -> None:
         state = TerminalUiState(max_lines=3)

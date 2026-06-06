@@ -11,6 +11,7 @@ from whispertome.audio.types import AudioBuffer
 from whispertome.config import STTConfig
 from whispertome.errors import ModelNotReadyError
 from whispertome.runtime.base import OnnxSessionHandle
+from whispertome.runtime.events import NULL_BUS, EventBus, RuntimeEvent
 from whispertome.runtime.onnx_session import NpuOnlyOnnxSessionFactory
 from whispertome.stt.base import SpeechToTextModel, Transcript
 
@@ -51,6 +52,10 @@ class QaiWhisperTranscriber(SpeechToTextModel):
         self._encoder: OnnxSessionHandle | None = None
         self._decoder: OnnxSessionHandle | None = None
         self._runner: QaiWhisperRunner | None = None
+        self._event_bus: EventBus = NULL_BUS
+
+    def set_event_bus(self, bus: EventBus) -> None:
+        self._event_bus = bus
 
     def load(self) -> None:
         if self._runner is not None:
@@ -76,7 +81,18 @@ class QaiWhisperTranscriber(SpeechToTextModel):
     def transcribe(self, audio: AudioBuffer) -> Transcript:
         self.load()
         assert self._runner is not None
-        return self._runner.transcribe(audio)
+        bus = self._event_bus
+        bus.publish(RuntimeEvent(source="stt", kind="start", value=0.65, detail="transcribing"))
+        try:
+            transcript = self._runner.transcribe(audio)
+        except Exception as exc:  # noqa: BLE001 — surface as an event, then re-raise
+            bus.publish(RuntimeEvent(source="stt", kind="error", detail=str(exc)))
+            raise
+        bus.publish(RuntimeEvent(
+            source="stt", kind="final", value=0.0, text=transcript.text,
+            provider=transcript.provider, elapsed_ms=transcript.latency_ms,
+        ))
+        return transcript
 
 
 class QaiWhisperRunner:

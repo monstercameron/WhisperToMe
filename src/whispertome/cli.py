@@ -200,6 +200,20 @@ class FallbackTextToSpeechModel(TextToSpeechModel):
         self._fallback.load()
         self._active = self._fallback
 
+    # Forward optional capabilities to whichever model is currently active.
+    def set_load_reporter(self, reporter) -> None:
+        self._primary.set_load_reporter(reporter)
+        self._fallback.set_load_reporter(reporter)
+
+    def list_voices(self) -> list[str]:
+        return (self._active or self._primary).list_voices()
+
+    def current_voice(self) -> str | None:
+        return (self._active or self._primary).current_voice()
+
+    def set_voice(self, voice: str) -> None:
+        (self._active or self._primary).set_voice(voice)
+
 
 class DebugKokoroSynthesizer(TextToSpeechModel):
     def __init__(self, config: AppConfig) -> None:
@@ -956,20 +970,34 @@ def run_wake_loop(
     ui.start()
     ui.boot("runtime graph", "building local voice adapters", 0.03)
     stt_model = prepare_stt_model(config, allow_non_npu=allow_non_npu)
+    # Async speech-event bus: STT publishes start/final events; the UI reacts off-thread
+    # (drives the activity waveform + status line) without blocking transcription.
+    from whispertome.runtime.events import EventBus, attach_speech_reactions
+
+    speech_bus = EventBus()
+    speech_bus.start()
+    attach_speech_reactions(speech_bus, ui)
+    if hasattr(stt_model, "set_event_bus"):
+        stt_model.set_event_bus(speech_bus)
     ui.boot("stt adapter", config.stt.backend, 0.10)
     tts_model = prepare_tts_model(
         config,
         allow_non_npu=allow_non_npu,
-        prefer_debug_non_npu=allow_non_npu,
+        prefer_debug_non_npu=should_prefer_debug_tts(config, allow_non_npu),
     )
     ui.boot("tts adapter", config.tts.backend, 0.16)
     organizer_store = build_organizer_store(config.project_root)
     ui.boot("memory bus", "sqlite organizer and preferences", 0.22)
+    from whispertome.tts.voice_tools import TtsVoiceController, build_voice_tools
+
+    voice_controller = TtsVoiceController()
+    voice_controller.bind(tts_model)
     responder = build_llm_responder(
         config,
         tool_registry=build_organization_tool_registry(
             config.project_root,
             store=organizer_store,
+            extra_tools=build_voice_tools(voice_controller),
         ),
         system_context_provider=organizer_store.preference_prompt_context,
     )
@@ -1790,7 +1818,7 @@ def run_demo(
     tts_model = prepare_tts_model(
         config,
         allow_non_npu=allow_non_npu,
-        prefer_debug_non_npu=allow_non_npu,
+        prefer_debug_non_npu=should_prefer_debug_tts(config, allow_non_npu),
     )
     if warmup:
         warmup_started = perf_counter()
@@ -2064,6 +2092,28 @@ def run_demo(
     return 0
 
 
+def _log_model_load_event(event) -> None:
+    logging.getLogger(__name__).info(
+        "model_load component=%s backend=%s status=%s stage=%s detail=%r"
+        " provider=%s cached=%s elapsed_ms=%s",
+        event.component, event.backend, event.status, event.stage or "-",
+        event.detail, event.provider or "-", event.cached, event.elapsed_ms,
+    )
+
+
+def _build_registry(config: AppConfig):
+    """ModelRegistry (the core loader) with the default logging load-listener attached.
+
+    Additional listeners (e.g. a boot-UI observer) can be registered via
+    `registry.add_load_listener(...)` by callers that hold the registry.
+    """
+    from whispertome.models.registry import ModelRegistry
+
+    registry = ModelRegistry(config)
+    registry.add_load_listener(_log_model_load_event)
+    return registry
+
+
 def prepare_stt_model(
     config: AppConfig,
     *,
@@ -2071,7 +2121,6 @@ def prepare_stt_model(
     prefer_debug_non_npu: bool | None = None,
 ) -> SpeechToTextModel:
     logger = logging.getLogger(__name__)
-    from whispertome.models.registry import ModelRegistry
 
     prefer_debug = (
         should_prefer_debug_stt(config, allow_non_npu)
@@ -2082,7 +2131,7 @@ def prepare_stt_model(
         logger.warning("debug_non_npu_stt_direct=true")
         return get_whisper_debug_non_npu(config)
 
-    return ModelRegistry(config).create_stt()
+    return _build_registry(config).create_stt()
 
 
 def prepare_tts_model(
@@ -2092,14 +2141,13 @@ def prepare_tts_model(
     prefer_debug_non_npu: bool = False,
 ) -> TextToSpeechModel:
     logger = logging.getLogger(__name__)
-    from whispertome.models.registry import ModelRegistry
 
     debug_tts = DebugKokoroSynthesizer(config)
     if allow_non_npu and prefer_debug_non_npu:
         logger.warning("debug_non_npu_tts_direct=true")
         return debug_tts
 
-    tts = ModelRegistry(config).create_tts()
+    tts = _build_registry(config).create_tts()
     if not allow_non_npu:
         return tts
 
@@ -2121,6 +2169,13 @@ def preload_debug_models(config: AppConfig) -> None:
 
 def should_prefer_debug_stt(config: AppConfig, allow_non_npu: bool) -> bool:
     return allow_non_npu and config.stt.backend == "whisper_onnx"
+
+
+def should_prefer_debug_tts(config: AppConfig, allow_non_npu: bool) -> bool:
+    # Supertonic has a verified NPU path, so it stays on the NPU (with Kokoro as the
+    # FallbackTextToSpeechModel backup). Only the kokoro_onnx backend, which has no NPU
+    # artifact, routes directly to the debug CPU synthesizer under --allow-non-npu.
+    return allow_non_npu and config.tts.backend == "kokoro_onnx"
 
 
 def summarize_demo_profiles(

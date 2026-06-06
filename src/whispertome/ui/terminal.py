@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import os
 import shutil
@@ -8,6 +9,7 @@ import textwrap
 import threading
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime
 from time import perf_counter
 from typing import TextIO
 
@@ -22,6 +24,33 @@ BLUE = "\x1b[34m"
 WHITE = "\x1b[37m"
 TUI_WIDTH_ENV = "WHISPERTOME_TUI_WIDTH"
 TUI_HEIGHT_ENV = "WHISPERTOME_TUI_HEIGHT"
+LOGGER = logging.getLogger(__name__)
+DISPLAY_TRANSLATION = str.maketrans(
+    {
+        "\u00a0": " ",
+        "\u2007": " ",
+        "\u202f": " ",
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\u2212": "-",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201a": "'",
+        "\u201b": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u201e": '"',
+        "\u2026": "...",
+        "\u2022": "*",
+        "\u00b0": " deg ",
+        "\u00d7": "x",
+        "\u00f7": "/",
+    }
+)
 
 
 class NullVoiceUi:
@@ -80,14 +109,18 @@ class TerminalUiState:
         self.stream_lines = deque(self.stream_lines, maxlen=self.max_lines)
 
     def set_status(self, text: str, detail: str = "") -> None:
-        self.status_text = text.strip() or "idle"
-        self.status_detail = detail.strip()
-        self.add_line(self.status_text if not detail else f"{self.status_text} - {detail}")
+        self.status_text = display_text(text).strip() or "idle"
+        self.status_detail = display_text(detail).strip()
+        self.add_line(
+            self.status_text
+            if not self.status_detail
+            else f"{self.status_text} - {self.status_detail}"
+        )
 
     def set_boot(self, phase: str, detail: str = "", progress: float = 0.0) -> None:
         self.boot_active = True
-        self.boot_phase = phase.strip() or "initializing"
-        self.boot_detail = detail.strip()
+        self.boot_phase = display_text(phase).strip() or "initializing"
+        self.boot_detail = display_text(detail).strip()
         self.boot_progress = max(0.0, min(1.0, float(progress)))
         line_detail = f" - {self.boot_detail}" if self.boot_detail else ""
         self.add_line(f"init {self.boot_phase}{line_detail}")
@@ -99,14 +132,14 @@ class TerminalUiState:
         self.boot_progress = 0.0
 
     def set_user(self, text: str) -> None:
-        self.user = text.strip()
+        self.user = display_text(text).strip()
 
     def set_assistant(self, text: str) -> None:
-        self.assistant = text.strip()
+        self.assistant = display_text(text).strip()
 
     def set_code_block(self, language: str, code: str) -> None:
-        self.code_language = language.strip() or "code"
-        self.code_text = code.strip("\r\n")
+        self.code_language = display_text(language).strip() or "code"
+        self.code_text = display_text(code).strip("\r\n")
 
     def clear_code_block(self) -> None:
         self.code_language = ""
@@ -116,7 +149,7 @@ class TerminalUiState:
         self.activity_value = max(0.0, min(1.0, float(value)))
 
     def add_line(self, text: str) -> None:
-        line = " ".join(text.strip().split())
+        line = " ".join(display_text(text).strip().split())
         if line:
             self.stream_lines.append(line)
 
@@ -147,6 +180,7 @@ class TerminalVoiceUi:
         max_lines: int = 10,
     ) -> None:
         self._stream = stream or sys.stdout
+        _configure_stream_for_display(self._stream)
         self._fps = max(4.0, fps)
         self._state = TerminalUiState(max_lines=max_lines)
         self._lock = threading.Lock()
@@ -154,14 +188,14 @@ class TerminalVoiceUi:
         self._render_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._frame = 0
+        self._render_failures = 0
 
     def start(self) -> None:
         if self._thread is not None:
             return
         self._stop_event.clear()
         self._render_event.set()
-        self._stream.write("\x1b[?25l")
-        self._stream.flush()
+        self._write_stream("\x1b[?25l")
         self._thread = threading.Thread(target=self._render_loop, daemon=True)
         self._thread.start()
 
@@ -171,8 +205,7 @@ class TerminalVoiceUi:
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
-        self._stream.write("\x1b[?25h" + RESET + "\n")
-        self._stream.flush()
+        self._write_stream("\x1b[?25h" + RESET + "\n")
 
     def status(self, text: str, detail: str = "") -> None:
         with self._lock:
@@ -232,14 +265,31 @@ class TerminalVoiceUi:
             self._render_event.clear()
             if self._stop_event.is_set():
                 break
-            with self._lock:
-                snapshot = self._state.copy()
-            width, height = terminal_size()
-            frame = render_frame(snapshot, width=width, height=height, frame=self._frame)
-            self._stream.write("\x1b[H\x1b[2J" + frame)
-            self._stream.flush()
+            try:
+                with self._lock:
+                    snapshot = self._state.copy()
+                width, height = terminal_size()
+                frame = render_frame(snapshot, width=width, height=height, frame=self._frame)
+                self._write_stream("\x1b[H\x1b[2J" + frame)
+                self._render_failures = 0
+            except Exception:
+                self._render_failures += 1
+                LOGGER.exception("terminal_tui_render_failed count=%d", self._render_failures)
+                self._write_stream(render_error_frame(*terminal_size()))
             self._frame += 1
             last_rendered = perf_counter()
+
+    def _write_stream(self, text: str) -> None:
+        try:
+            self._stream.write(text)
+        except UnicodeEncodeError:
+            encoding = getattr(self._stream, "encoding", None) or "ascii"
+            safe = text.encode(encoding, errors="replace").decode(
+                encoding,
+                errors="replace",
+            )
+            self._stream.write(safe)
+        self._stream.flush()
 
 
 def terminal_size() -> tuple[int, int]:
@@ -259,56 +309,74 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _configure_stream_for_display(stream: TextIO) -> None:
+    reconfigure = getattr(stream, "reconfigure", None)
+    if not callable(reconfigure):
+        return
+    try:
+        reconfigure(errors="replace")
+    except (OSError, ValueError):
+        return
+
+
+def display_text(text: str) -> str:
+    normalized = str(text).translate(DISPLAY_TRANSLATION)
+    return normalized.encode("ascii", errors="replace").decode("ascii")
+
+
+def render_error_frame(width: int, height: int) -> str:
+    width = max(60, width)
+    height = max(8, height)
+    line = border_line(min(width, 96), "-")
+    body = [
+        line,
+        wrap_panel_line(
+            f"{YELLOW}STATUS:{RESET} TUI render recovered",
+            min(width, 96),
+            YELLOW,
+        ),
+        wrap_panel_line(
+            (
+                f"{DIM}The voice loop is still running. "
+                f"Check logs for terminal_tui_render_failed.{RESET}"
+            ),
+            min(width, 96),
+            YELLOW,
+        ),
+        line,
+    ]
+    while len(body) < min(height, 8):
+        body.append("")
+    return "\x1b[H\x1b[2J" + "\n".join(body[:height]) + "\n"
+
+
 def render_frame(state: TerminalUiState, *, width: int, height: int, frame: int) -> str:
     width = max(60, width)
     available_height = max(24, height)
     if state.boot_active:
         return render_boot_frame(state, width=width, height=available_height, frame=frame)
 
-    compact = width <= 92 or available_height <= 30
-    content_width = min(width - 4, 96 if compact else 112)
-    polygon_width = min(48 if compact else 58, content_width)
-    has_code = bool(state.code_text)
-    if has_code:
-        polygon_height = 7 if compact else 11
-    else:
-        polygon_height = 9 if compact else 15 if available_height >= 30 else 11
-    title = f"{BOLD}{CYAN}WHISPER TO ME{RESET}"
-    status = color_for_status(state.status_text) + state.status_text.upper() + RESET
-    detail = f" {DIM}{state.status_detail}{RESET}" if state.status_detail else ""
-    text_body_lines = 2 if compact and has_code else 3
-
+    frame_width = min(width, 118)
+    body_height = max(13, available_height - 6)
+    compact = frame_width <= 92 or available_height <= 30
+    left_width = 29 if compact else 34
+    gap = 2
+    right_width = max(30, frame_width - left_width - gap)
     lines: list[str] = []
-    lines.append(center(title, width))
-    lines.append(center(f"{status}{detail}", width))
-    lines.append("")
-    for polygon_line in render_polygon(
-        polygon_width,
-        polygon_height,
-        frame=frame,
-        activity=max(state.activity_value, status_activity_boost(state.status_text)),
-        status=state.status_text,
-    ):
-        lines.append(center(polygon_line, width))
-    lines.append("")
+    lines.extend(render_runtime_header(state, frame_width))
     lines.extend(
-        render_text_row(
-            "INPUT",
-            state.user or "...",
-            "OUTPUT",
-            state.assistant or "...",
-            content_width,
-            body_lines=text_body_lines,
+        render_runtime_columns(
+            state,
+            left_width=left_width,
+            right_width=right_width,
+            gap=gap,
+            height=body_height,
+            frame=frame,
         )
     )
-    lines.append("")
-    if has_code:
-        code_height = 5 if compact else 8 if available_height >= 34 else 6
-        lines.extend(render_code_box(state, content_width, code_height=code_height, frame=frame))
-        lines.append("")
-    stream_budget = max(1, available_height - len(lines))
-    lines.extend(render_stream(state, content_width, max_height=stream_budget))
-    return "\n".join(lines[:available_height]) + "\n"
+    lines.extend(render_runtime_footer(state, frame_width))
+    padded = [center(line, width) for line in lines[:available_height]]
+    return "\n".join(padded) + "\n"
 
 
 def render_boot_frame(
@@ -326,31 +394,53 @@ def render_boot_frame(
     progress = max(0.0, min(1.0, state.boot_progress))
     shimmer = ["-", "\\", "|", "/"][frame % 4]
 
-    lines: list[str] = []
-    lines.append(center(f"{BOLD}{CYAN}WHISPER TO ME // NPU BOOT{RESET}", width))
-    lines.append(center(f"{DIM}LOCAL VOICE RUNTIME HANDSHAKE {shimmer}{RESET}", width))
-    lines.append("")
-    lines.extend(
-        center(line, width)
+    frame_width = min(width, 118)
+    inner = frame_width - 4
+    body: list[str] = []
+    body.append(
+        pad_visible(
+            f"{BOLD}{CYAN}WHISPER TO ME // NPU BOOT{RESET}"
+            + " "
+            + f"{DIM}STT -> LLM -> TOOLS -> TTS{RESET}",
+            inner,
+        )
+    )
+    body.append(pad_visible(f"{CYAN}BOOTSTRAPPING MODULES{RESET}", inner))
+    body.extend(
+        center(line, inner)
         for line in render_boot_lattice(
             min(70, content_width),
-            13 if available_height >= 32 else 11,
+            11 if available_height < 32 else 13,
             frame=frame,
             progress=progress,
         )
     )
-    lines.append("")
-    phase_line = f"{BOLD}{WHITE}{phase.upper()}{RESET} {DIM}{detail}{RESET}"
-    lines.append(center(phase_line, width))
-    lines.append(center(render_progress_bar(content_width, progress, frame=frame), width))
-    lines.append("")
-    lines.extend(center(line, width) for line in render_boot_modules(progress, content_width))
+    body.append(pad_visible(f"{BOLD}{WHITE}{phase.upper()}{RESET} {DIM}{detail}{RESET}", inner))
+    body.append(render_progress_bar(inner, progress, frame=frame))
+    body.extend(render_boot_modules(progress, inner))
     if state.stream_lines and available_height >= 32:
-        lines.append("")
-        lines.append(center(f"{BOLD}{WHITE}BOOT STREAM{RESET}", width))
-        for item in list(state.stream_lines)[-4:]:
-            lines.append(center(f"{DIM}> {item}{RESET}", width))
-    return "\n".join(lines[:available_height]) + "\n"
+        for item in list(state.stream_lines)[-3:]:
+            body.append(pad_visible(f"{DIM}> {fit_plain(item, inner - 2)}{RESET}", inner))
+
+    usable_body = max(1, available_height - 2)
+    status_line = pad_visible(
+        f"{YELLOW}STATUS:{RESET} connecting to model... {CYAN}{shimmer}{RESET}",
+        inner,
+    )
+    body = body[:usable_body]
+    while len(body) < usable_body - 1:
+        wave = render_waveform(inner, frame=frame + len(body), activity=progress)
+        body.append(f"{CYAN}{wave}{RESET}")
+    if len(body) < usable_body:
+        body.append(status_line)
+    else:
+        body[-1] = status_line
+
+    top = border_line(frame_width, "-")
+    rendered = [top]
+    rendered.extend(wrap_panel_line(line, frame_width, CYAN) for line in body)
+    rendered.append(top)
+    return "\n".join(rendered[:available_height]) + "\n"
 
 
 def render_boot_lattice(
@@ -441,6 +531,371 @@ def render_boot_modules(progress: float, width: int) -> list[str]:
     return columns
 
 
+def render_runtime_header(state: TerminalUiState, width: int) -> list[str]:
+    status = fit_plain(state.status_text.upper(), 22)
+    clock = datetime.now().strftime("%H:%M:%S")
+    pipeline = "STT -> LLM -> TOOLS -> TTS"
+    if width < 96:
+        content = (
+            f"{BOLD}{CYAN}WHISPER TO ME{RESET}"
+            f"  |  {CYAN}{pipeline}{RESET}"
+            f"  |  {color_for_status(state.status_text)}{status}{RESET}"
+        )
+    else:
+        content = (
+            f"{BOLD}{CYAN}WHISPER TO ME{RESET}"
+            f"  |  {GREEN}SESSION ACTIVE{RESET}"
+            f"  |  {CYAN}{pipeline}{RESET}"
+            f"  |  {color_for_status(state.status_text)}{status}{RESET}"
+        )
+    if width >= 76:
+        content = pad_visible(content, width - 14) + f"{DIM}{clock}{RESET}"
+    return [border_line(width, "-"), wrap_panel_line(content, width, CYAN), border_line(width, "-")]
+
+
+def render_runtime_columns(
+    state: TerminalUiState,
+    *,
+    left_width: int,
+    right_width: int,
+    gap: int,
+    height: int,
+    frame: int,
+) -> list[str]:
+    transcript_height = 7 if height >= 20 else 6
+    if state.code_text:
+        activity_height = max(7, height - transcript_height - 1)
+    else:
+        activity_height = max(8, height - transcript_height - 1)
+
+    left = render_pipeline_panel(state, left_width, height=height, frame=frame)
+    right = render_live_transcript_panel(
+        state,
+        right_width,
+        height=transcript_height,
+        frame=frame,
+    )
+    right.extend([" " * right_width])
+    right.extend(
+        render_activity_panel(
+            state,
+            right_width,
+            height=activity_height,
+            frame=frame,
+        )
+    )
+    left = fit_block_height(left, height, left_width)
+    right = fit_block_height(right, height, right_width)
+    return [
+        left_line + (" " * gap) + right_line
+        for left_line, right_line in zip(left, right, strict=False)
+    ]
+
+
+def render_pipeline_panel(
+    state: TerminalUiState,
+    width: int,
+    *,
+    height: int,
+    frame: int,
+) -> list[str]:
+    stage = active_stage(state.status_text)
+    steps = [
+        ("STT", "speech to text"),
+        ("LLM", "thinking"),
+        ("TOOLS", "function calling"),
+        ("TTS", "text to speech"),
+    ]
+    body: list[str] = []
+    polygon_height = 7 if height <= 24 else 9
+    body.extend(
+        render_polygon(
+            max(20, width - 6),
+            polygon_height,
+            frame=frame,
+            activity=max(state.activity_value, status_activity_boost(state.status_text)),
+            status=state.status_text,
+        )
+    )
+    body.append("")
+    compact = width <= 30 or height <= 24
+    for index, (name, detail) in enumerate(steps):
+        state_label = step_state(name, stage)
+        marker = "[>]" if state_label == "active" else "[x]" if state_label == "complete" else "[-]"
+        color = step_color(name)
+        pulse = "..." if state_label == "active" and frame % 2 else "   "
+        body.append(f"{color}{index + 1}) {name:<5}{RESET} {marker} {step_copy(state_label)}")
+        if not compact:
+            body.append(f"   {DIM}{detail}{RESET} {color}{pulse}{RESET}")
+        if index < len(steps) - 1:
+            body.append(f"{DIM}        v{RESET}")
+
+    panel_height = max(8, height)
+    return render_panel("ACTIVE STEP / PIPELINE", body, width, panel_height, color=CYAN)
+
+
+def render_live_transcript_panel(
+    state: TerminalUiState,
+    width: int,
+    *,
+    height: int,
+    frame: int,
+) -> list[str]:
+    activity = max(state.activity_value, status_activity_boost(state.status_text))
+    waveform = render_waveform(width - 6, frame=frame, activity=activity)
+    body = [
+        f"{CYAN}{waveform}{RESET}",
+        f"{GREEN}{fit_plain(state.user or '...', width - 6)}{RESET}",
+    ]
+    wrapped = textwrap.wrap(state.user or "", width=max(20, width - 6))
+    if len(wrapped) > 1:
+        body.extend(f"{GREEN}{line}{RESET}" for line in wrapped[1:3])
+    return render_panel("LIVE TRANSCRIPT / INPUT", body, width, height, color=GREEN)
+
+
+def render_activity_panel(
+    state: TerminalUiState,
+    width: int,
+    *,
+    height: int,
+    frame: int,
+) -> list[str]:
+    if state.code_text:
+        body = render_code_activity_body(state, width - 4, max(1, height - 3), frame=frame)
+        return render_panel(
+            f"{state.code_language.upper() or 'CODE'} VIEW / OUTPUT / SYSTEM STREAM",
+            body,
+            width,
+            height,
+            color=YELLOW,
+        )
+
+    body: list[str] = []
+    assistant_lines = textwrap.wrap(state.assistant or "...", width=max(20, width - 6))[:4]
+    body.extend(f"{MAGENTA}{line}{RESET}" for line in assistant_lines)
+    if body:
+        body.append(f"{DIM}{'-' * max(8, width - 6)}{RESET}")
+    body.append(f"{YELLOW}SYSTEM STREAM{RESET}")
+
+    stream_budget = max(1, height - len(body) - 4)
+    stream_lines = stream_activity_lines(state, width - 6, stream_budget)
+    body.extend(stream_lines)
+    return render_panel("ASSISTANT / OUTPUT / TOOLS", body, width, height, color=MAGENTA)
+
+
+def render_runtime_footer(state: TerminalUiState, width: int) -> list[str]:
+    activity = max(state.activity_value, status_activity_boost(state.status_text))
+    detail = state.status_detail or "ready"
+    if width < 90:
+        content = (
+            f"{CYAN}STATUS:{RESET} {fit_plain(state.status_text.upper(), 18)}"
+            f"  {CYAN}DETAIL:{RESET} {fit_plain(detail, 14)}"
+            f"  {GREEN}CTRL+C to stop{RESET}"
+        )
+    else:
+        content = (
+            f"{CYAN}STATUS:{RESET} {fit_plain(state.status_text.upper(), 18)}"
+            f"  {CYAN}DETAIL:{RESET} {fit_plain(detail, 24)}"
+            f"  {CYAN}ACTIVITY:{RESET} {activity:0.2f}"
+            f"  {GREEN}CTRL+C to stop{RESET}"
+        )
+    return [border_line(width, "-"), wrap_panel_line(content, width, CYAN), border_line(width, "-")]
+
+
+def render_code_activity_body(
+    state: TerminalUiState,
+    inner_width: int,
+    body_height: int,
+    *,
+    frame: int,
+) -> list[str]:
+    body: list[str] = []
+    if state.assistant:
+        body.extend(
+            f"{MAGENTA}{line}{RESET}"
+            for line in textwrap.wrap(state.assistant, width=inner_width)[:2]
+        )
+        body.append(f"{DIM}{'-' * max(8, inner_width)}{RESET}")
+
+    code_lines = [line.expandtabs(2) for line in state.code_text.splitlines()] or [""]
+    remaining = max(1, body_height - len(body))
+    code_width = max(8, inner_width - 4)
+    max_offset = max(0, len(code_lines) - remaining)
+    offset = 0
+    visible = code_lines[offset : offset + remaining]
+    line_number = offset + 1
+    for line in visible:
+        prefix = f"{line_number:>2} "
+        body.append(f"{YELLOW}{prefix}{RESET}{fit_code_line(line, code_width)}")
+        line_number += 1
+    if max_offset:
+        end_line = min(offset + remaining, len(code_lines))
+        body.append(f"{DIM}{offset + 1}-{end_line}/{len(code_lines)}{RESET}")
+    return body[:body_height]
+
+
+def stream_activity_lines(state: TerminalUiState, width: int, max_lines: int) -> list[str]:
+    lines: list[str] = []
+    for item in list(state.stream_lines)[-max_lines:]:
+        wrapped = textwrap.wrap(item, width=max(16, width - 2), max_lines=2, placeholder="...")
+        for line in wrapped:
+            lines.append(f"{DIM}> {line}{RESET}")
+    if not lines:
+        lines.append(f"{DIM}> waiting for events{RESET}")
+    return lines[-max_lines:]
+
+
+def active_stage(status: str) -> str:
+    lowered = status.lower()
+    if "tts" in lowered or "play" in lowered or "speak" in lowered:
+        return "TTS"
+    if "tool" in lowered or "powershell" in lowered or "capture" in lowered:
+        return "TOOLS"
+    if (
+        "openai" in lowered
+        or "cerebras" in lowered
+        or "contact" in lowered
+        or "llm" in lowered
+        or "model" in lowered
+    ):
+        return "LLM"
+    return "STT"
+
+
+def step_state(name: str, active: str) -> str:
+    order = ["STT", "LLM", "TOOLS", "TTS"]
+    current = order.index(active) if active in order else 0
+    index = order.index(name)
+    if index < current:
+        return "complete"
+    if index == current:
+        return "active"
+    return "waiting"
+
+
+def step_copy(value: str) -> str:
+    if value == "complete":
+        return "complete"
+    if value == "active":
+        return "running"
+    return "waiting"
+
+
+def step_color(name: str) -> str:
+    if name == "STT":
+        return CYAN
+    if name in {"LLM", "TOOLS"}:
+        return YELLOW
+    return MAGENTA
+
+
+def render_waveform(width: int, *, frame: int, activity: float) -> str:
+    width = max(12, width)
+    activity = max(0.32, min(1.0, activity + 0.25))
+    chars = []
+    for index in range(width):
+        wave = abs(math.sin((index + frame * 0.8) * 0.45))
+        ripple = abs(math.sin((index * 0.17) - frame * 0.22))
+        value = (wave * 0.72 + ripple * 0.28) * activity
+        if value > 0.72:
+            chars.append("|")
+        elif value > 0.42:
+            chars.append(":")
+        elif value > 0.20:
+            chars.append(".")
+        else:
+            chars.append(" ")
+    return "".join(chars).rstrip() or "."
+
+
+def render_panel(
+    title: str,
+    body: list[str],
+    width: int,
+    height: int,
+    *,
+    color: str,
+) -> list[str]:
+    width = max(16, width)
+    height = max(3, height)
+    inner = width - 4
+    body_budget = height - 3
+    rendered = [border_line(width, "-")]
+    rendered.append(wrap_panel_line(f"{color}{fit_plain(title, inner)}{RESET}", width, color))
+    for line in body[:body_budget]:
+        rendered.append(wrap_panel_line(line, width, color))
+    while len(rendered) < height - 1:
+        rendered.append(wrap_panel_line("", width, color))
+    rendered.append(border_line(width, "-"))
+    return rendered[:height]
+
+
+def fit_block_height(lines: list[str], height: int, width: int) -> list[str]:
+    if len(lines) > height:
+        return lines[:height]
+    return lines + [" " * width for _ in range(height - len(lines))]
+
+
+def border_line(width: int, char: str = "-") -> str:
+    return "+" + (char * max(0, width - 2)) + "+"
+
+
+def wrap_panel_line(text: str, width: int, color: str) -> str:
+    inner = width - 4
+    return color + "| " + RESET + pad_visible(text, inner) + color + " |" + RESET
+
+
+def pad_visible(text: str, width: int) -> str:
+    visible = strip_ansi_len(text)
+    if visible >= width:
+        return trim_visible(text, width)
+    return text + (" " * (width - visible))
+
+
+def fit_plain(text: str, width: int) -> str:
+    text = " ".join(text.strip().split())
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[: width - 3] + "..."
+
+
+def fit_code_line(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[: width - 3] + "..."
+
+
+def trim_visible(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    count = 0
+    result: list[str] = []
+    in_escape = False
+    for char in text:
+        if char == "\x1b":
+            in_escape = True
+            result.append(char)
+            continue
+        if in_escape:
+            result.append(char)
+            if char == "m":
+                in_escape = False
+            continue
+        if count >= width:
+            break
+        result.append(char)
+        count += 1
+    return "".join(result) + (RESET if "\x1b[" in text else "")
+
+
 def render_polygon(
     width: int,
     height: int,
@@ -450,7 +905,7 @@ def render_polygon(
     status: str,
 ) -> list[str]:
     width = max(22, width)
-    height = max(9, height)
+    height = max(5, height)
     grid = [[" " for _ in range(width)] for _ in range(height)]
     cx = (width - 1) / 2.0
     cy = (height - 1) / 2.0
@@ -650,7 +1105,7 @@ def strip_ansi_len(text: str) -> int:
 def color_for_status(status: str) -> str:
     lowered = status.lower()
     if "listen" in lowered:
-        return BLUE
+        return GREEN
     if (
         "wake" in lowered
         or "detected" in lowered

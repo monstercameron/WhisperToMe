@@ -37,21 +37,27 @@ class VoiceLoop:
 
     @classmethod
     def from_config(cls, config: AppConfig) -> VoiceLoop:
+        from whispertome.tts.voice_tools import TtsVoiceController, build_voice_tools
+
         registry = ModelRegistry(config)
         vad = EnergyVad(config.audio.vad_rms_threshold)
         organizer_store = build_organizer_store(config.project_root)
+        tts = registry.create_tts()
+        voice_controller = TtsVoiceController()
+        voice_controller.bind(tts)
         return cls(
             config=config,
             components=VoiceLoopComponents(
                 microphone=MicrophoneInput(config.audio),
                 speaker=SpeakerOutput(),
                 stt=registry.create_stt(),
-                tts=registry.create_tts(),
+                tts=tts,
                 responder=build_llm_responder(
                     config,
                     tool_registry=build_organization_tool_registry(
                         config.project_root,
                         store=organizer_store,
+                        extra_tools=build_voice_tools(voice_controller),
                     ),
                     system_context_provider=organizer_store.preference_prompt_context,
                 ),

@@ -143,6 +143,7 @@ class DesktopTerminalHost:
         self._status_var: object | None = None
         self._stop_button: object | None = None
         self._tray_icon: object | None = None
+        self._terminal_font: object | None = None
         self._current_tags: tuple[str, ...] = ()
         self._stop_requested = False
         self._close_after_stop = False
@@ -209,6 +210,7 @@ class DesktopTerminalHost:
         self._stop_button = stop_button
 
         terminal_font = tkfont.Font(family="Cascadia Mono", size=self._config.font_size)
+        self._terminal_font = terminal_font
         terminal = tk.Text(
             root,
             bg="#05070b",
@@ -218,8 +220,8 @@ class DesktopTerminalHost:
             wrap=tk.NONE,
             borderwidth=0,
             highlightthickness=0,
-            padx=10,
-            pady=8,
+            padx=4,
+            pady=0,
         )
         terminal.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         terminal.configure(state=tk.DISABLED)
@@ -241,7 +243,7 @@ class DesktopTerminalHost:
             ),
         )
         self._tray_icon.start()  # type: ignore[attr-defined]
-        self._start_process()
+        root.after(80, self._start_process)  # type: ignore[attr-defined]
         root.after(16, self._drain_output)
         root.after(120, self._poll_wake_event)
         root.after(120, self._poll_window_command)
@@ -368,18 +370,30 @@ class DesktopTerminalHost:
         )
 
     def _start_process(self) -> None:
+        if self._process is not None:
+            return
+        root = self._root
+        if root is not None:
+            root.update_idletasks()  # type: ignore[attr-defined]
         creationflags = 0
         if sys.platform == "win32":
             creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
             creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        tui_columns, tui_rows = _estimate_tui_viewport(
+        fallback_columns, fallback_rows = _estimate_tui_viewport(
             self._config.width,
             self._config.height,
             self._config.font_size,
         )
+        tui_columns, tui_rows = _measure_tui_viewport(
+            self._terminal,
+            self._terminal_font,
+            fallback_columns=fallback_columns,
+            fallback_rows=fallback_rows,
+        )
         env = os.environ.copy()
         env[TUI_WIDTH_ENV] = str(tui_columns)
         env[TUI_HEIGHT_ENV] = str(tui_rows)
+        env["PYTHONIOENCODING"] = "utf-8:replace"
         env[DESKTOP_HOST_PID_ENV] = str(os.getpid())
         env[DESKTOP_WINDOW_TITLE_ENV] = self._config.title
         if self._config.window_command_file is not None:
@@ -455,6 +469,7 @@ class DesktopTerminalHost:
         if terminal is None:
             return
         started = perf_counter()
+        full_frame = FULL_FRAME_CLEAR in text
         terminal.configure(state="normal")  # type: ignore[attr-defined]
         index = 0
         for match in ANSI_RE.finditer(text):
@@ -465,7 +480,10 @@ class DesktopTerminalHost:
         if index < len(text):
             self._insert_text(text[index:])
         terminal.configure(state="disabled")  # type: ignore[attr-defined]
-        terminal.see("end")  # type: ignore[attr-defined]
+        if full_frame:
+            terminal.yview_moveto(0.0)  # type: ignore[attr-defined]
+        else:
+            terminal.see("end")  # type: ignore[attr-defined]
         render_ms = (perf_counter() - started) * 1000.0
         if render_ms >= self._config.slow_render_log_ms:
             LOGGER.info("desktop_tui_slow_render latency_ms=%.1f chars=%d", render_ms, len(text))
@@ -741,9 +759,44 @@ def _estimate_tui_viewport(
 ) -> tuple[int, int]:
     char_width = max(6.0, font_size * 0.82)
     line_height = max(12.0, font_size * 1.55)
-    columns = int((window_width - 80) / char_width)
-    rows = int((window_height - 150) / line_height)
+    columns = int((window_width - 120) / char_width)
+    rows = int((window_height - 190) / line_height)
     return max(60, min(112, columns)), max(24, min(34, rows))
+
+
+def _measure_tui_viewport(
+    terminal: object | None,
+    terminal_font: object | None,
+    *,
+    fallback_columns: int,
+    fallback_rows: int,
+) -> tuple[int, int]:
+    if terminal is None or terminal_font is None:
+        return fallback_columns, fallback_rows
+    try:
+        terminal.update_idletasks()  # type: ignore[attr-defined]
+        width_px = int(terminal.winfo_width())  # type: ignore[attr-defined]
+        height_px = int(terminal.winfo_height())  # type: ignore[attr-defined]
+        padx = _widget_int(terminal.cget("padx"))  # type: ignore[attr-defined]
+        pady = _widget_int(terminal.cget("pady"))  # type: ignore[attr-defined]
+        char_width = max(1, int(terminal_font.measure("M")))  # type: ignore[attr-defined]
+        line_height = max(1, int(terminal_font.metrics("linespace")))  # type: ignore[attr-defined]
+    except Exception as exc:
+        LOGGER.debug("desktop_tui_measure_failed error=%s", exc)
+        return fallback_columns, fallback_rows
+
+    usable_width = max(1, width_px - (padx * 2))
+    usable_height = max(1, height_px - (pady * 2))
+    columns = max(60, min(118, int(usable_width / char_width)))
+    rows = max(24, min(40, int(usable_height / line_height)))
+    return columns, rows
+
+
+def _widget_int(value: object) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _format_geometry(placement: WindowPlacement) -> str:

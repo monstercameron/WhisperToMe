@@ -844,3 +844,135 @@ Audio played back fine on speakers; the diffusion loop (`vector_estimator` x ste
 Net: Supertonic is the TTS that runs on this X2 NPU today — fastest of the three AND
 off-CPU (the all-day-power goal). Remaining: cache the HTP context (warmup), then the
 parallel agent can wire it in as a `TextToSpeechModel` backend.
+
+### Milestone 25: Supertonic wired into the app as the NPU TTS backend
+
+Integrated through the existing TTS abstraction so switching is config-only:
+- New `tts/supertonic_onnx.py` `SupertonicOnnxSynthesizer` implements `TextToSpeechModel`.
+  It static-fixes the source ONNX to the fixed dims (text=128, frames=192) into
+  `artifacts/supertonic_static/` (cached, regenerated if source is newer), creates the 4
+  stages via the shared `NpuOnlyOnnxSessionFactory` (QNN HTP, no CPU fallback), and keeps
+  tokenization / length-regulation / the diffusion loop / trim on the CPU. Frontend ported
+  in-package (no coupling to the parallel agent's `supertonic_inference.py`).
+- `models/registry.py`: `create_tts()` now dispatches `supertonic` -> SupertonicOnnxSynthesizer,
+  `kokoro_onnx` -> KokoroOnnxSynthesizer.
+- `config.py`: default `WHISPERTOME_TTS_BACKEND` is now `supertonic`; added
+  `WHISPERTOME_SUPERTONIC_DIR`, `WHISPERTOME_SUPERTONIC_VOICE` (M1), `WHISPERTOME_SUPERTONIC_STEPS` (10).
+- `cli.py`: added `should_prefer_debug_tts()` (mirrors the STT pattern) so only `kokoro_onnx`
+  routes to the debug CPU synth under `--allow-non-npu`; `supertonic` stays on the NPU with
+  Kokoro as the `FallbackTextToSpeechModel` backup.
+
+Switching: `WHISPERTOME_TTS_BACKEND=supertonic` (NPU, default) | `=kokoro_onnx` (CPU backup).
+Verified: full suite 112 passed; `ModelRegistry.create_tts()` -> NPU synth 595 ms / 5.95 s
+audio (`provider=QNNExecutionProvider`); backend switch returns the right adapter both ways;
+audio plays correctly. HTP compile ~18.5 s at load (still uncached — `ep.context_enable=1`
+is the next optimization).
+
+NOTE on collision: the parallel agent is committing with `git add -A`, which swept my
+`registry.py` edit into their commit `8a56dfe`. My `config.py`/`cli.py`/`tts/supertonic_onnx.py`
+changes are currently in the working tree; they may likewise get absorbed. Functionally fine,
+but the canonical history will attribute these to mixed commits.
+
+### Milestone 26: HTP context caching (warmup once)
+
+`SupertonicOnnxSynthesizer` now compiles each stage to a QNN EPContext ONNX on first load
+(`ep.context_enable=1` + `ep.context_file_path`, embedded binary) into
+`artifacts/supertonic_static/<stage>_ctx.onnx`, then loads those on subsequent runs.
+Generating the context with this machine's ORT-QNN stack avoids the version-mismatch that
+broke the parallel agent's prebuilt binaries. Measured: **cold load 18.8 s -> warm load 0.5 s**
+(across process restarts). Falls back to on-the-fly compile if QNN/devices are unavailable.
+
+### Milestone 27: Model-load event API
+
+New `models/loading.py`: `ModelLoadEvent` + `LoadListener` + `ModelLoadReporter`. The core
+loader (`ModelRegistry`) owns the listener list (`add_load_listener`) and attaches a reporter
+to every model it builds (`set_load_reporter`, default no-op on the STT/TTS base classes, so
+existing adapters are unaffected). Supertonic emits `start` / per-stage `stage`
+(cached vs compiling, timing) / final `loaded` (with provider). `cli._build_registry` attaches
+a default logging listener (`model_load component=... status=... stage=...`); richer observers
+(boot UI, voice loop) can register their own. Verified events fire end-to-end.
+
+### Milestone 28: Runtime voice toggle via an LLM tool
+
+Voices in Supertonic are just style-embedding files fed to the same NPU graphs, so switching
+is a live data swap — no recompile/reload. Added to the `TextToSpeechModel` base:
+`list_voices()`, `current_voice()`, `set_voice()` (default `VoiceNotSupportedError`).
+Supertonic implements them against `model/voice_styles/*.json`. `FallbackTextToSpeechModel`
+forwards these to the active model. New `tts/voice_tools.py`: a late-bindable
+`TtsVoiceController` + `build_voice_tools()` exposing agent tools `tts_list_voices` and
+`tts_set_voice`, wired into the wake-loop and `pipeline.VoiceLoop` tool registries via the new
+`extra_tools` arg on `build_organization_tool_registry`. Verified: tool lists `[F1, M1]`,
+switches both ways, rejects unknown voices with the available list; F1/M1 render distinct audio.
+Only F1 and M1 ship today; dropping more `voice_styles/*.json` adds more (custom cloning needs
+the style-encoder, which is not exported). 118 tests pass.
+
+### Milestone 29: Long-text repetition + short-clip slowness fixes
+
+Two issues reported on longer/streamed use: random word repetition, and ~0.8-0.9x RTF on
+short replies. Root causes + fixes:
+
+- **Repetition**: the adapter hard-truncated tokens at 128, which dropped text AND the closing
+  `</lang>` tag — causing the model to ramble/repeat; and audio beyond the 192-frame cap was
+  clipped. Verified: a 250-token sentence was cut to 128 (16.6s predicted -> 13.4s cap).
+  Fix: `_split_text()` chunks input at sentence -> clause -> word boundaries so every segment
+  fits the text window with its own tags; `synthesize()` renders each segment and concatenates
+  with a small inter-segment gap. The 250-token sentence now splits into 3 segments, full
+  17.6s audio, no truncation.
+- **Slowness on short clips**: the diffusion loop always ran the full 192 frames, so a 1s reply
+  paid the same ~600ms. Fix: **frame bucketing** — `FRAME_BUCKETS=(96,192)`; only
+  vector_estimator/vocoder depend on frame count, so each is compiled per bucket (cached as
+  `*_ctx_f{frames}.onnx`) and each segment routes to the smallest bucket that fits its predicted
+  length. Short reply (1.8s audio) dropped from ~600ms to **325ms (RTF 0.18, ~5.5x realtime)**;
+  medium 4.5s audio RTF 0.074.
+
+Cost: cold compile now ~26s (6 graphs: 2 text + 2 stages x 2 buckets), warm load ~0.9s (cached).
+120 tests pass.
+
+### Milestone 30: Async STT event bus -> dynamic UI reaction
+
+New `runtime/events.py`: `RuntimeEvent` + `EventBus` (non-blocking `publish()`, background
+daemon dispatch thread, listener-error isolation, `NULL_BUS` default; publishes inline if not
+started so events are never dropped). Mirrors the load-event API but for repeated runtime events.
+
+- STT base gains `set_event_bus()` (no-op default). `QaiWhisperTranscriber.transcribe` publishes
+  `stt/start` (before) and `stt/final` (after, with text + provider + latency), `stt/error` on failure.
+- `attach_speech_reactions(bus, ui)` subscribes a listener that maps STT events onto the voice-UI
+  protocol (`status`/`activity`/`user_text`) — so the activity waveform + status line react
+  *off the STT thread*: jump to activity 0.65 + "transcribing" on start, settle to 0.0 + show the
+  transcript on final. Uses the duck-typed UI protocol, so it needed no edit to the peer's `terminal.py`.
+- Wired into the live wake loop (`run`): create bus, `attach_speech_reactions(bus, ui)`,
+  `stt_model.set_event_bus(bus)`.
+
+Verified end-to-end: STT (NPU) transcribing the TTS output fired reactions on a *different thread*
+than main (+0.1ms transcribing/0.65, +696ms "heard"/transcript/0.0). 5 new unit tests; 125 pass.
+Natural next step: feed live mic RMS as `stt/level` events so the waveform tracks real loudness
+while speaking (the VAD/capture path is the producer).
+
+### Milestone 31: Supertonic speaking-rate control (fix "drunk"/sluggish pacing)
+
+Default Supertonic pacing sounded slow/slurred. Supertonic controls rate by dividing the
+predicted duration by a speed factor (more speed -> fewer frames -> tighter speech). Added a
+dedicated, env-tunable knob so this is adjustable without code changes and without affecting
+Kokoro:
+
+- `TTSConfig.supertonic_speed`, read from **`WHISPERTOME_SUPERTONIC_SPEED`** (default **1.15**).
+- Adapter uses `dur_s = predicted / supertonic_speed` (was the shared `config.speed`).
+- A/B at fixed text: 1.0 -> 6.11s audio, 1.15 -> 5.32s (~13% tighter; frame-bucket quantization
+  rounds the exact ratio). Kokoro still uses `WHISPERTOME_TTS_SPEED`.
+
+Verified env override (unset->1.15, =1.0 original, =1.3 snappier); 126 tests pass.
+
+### Milestone 32: Desktop TUI fit and centered 800x600 shell
+
+The 800x600 desktop shell looked good but wasted too much right and bottom space. A direct
+window screenshot showed the terminal content was rendered as a smaller virtual grid than the
+Tk text widget could actually display. The first screenshot attempt grabbed pixels behind the
+window, so `PrintWindow` became the reliable visual-check path for the embedded desktop app.
+
+Fix: the host now waits for Tk layout, measures the actual text widget and Cascadia Mono cell
+size, advertises that measured grid to the child TUI, and removes extra text-widget padding.
+The viewport moved from `95x30` to `99x32` in the same fixed 800x600 window, which tightens the
+right and bottom margins without clipping. The host also keeps full-screen TUI frames pinned to
+the top so old scrollback cannot hide the current frame.
+
+Verified with a fresh app run, screenshot comparison, focused desktop/TUI tests, and ruff.
