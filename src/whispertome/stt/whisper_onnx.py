@@ -26,27 +26,13 @@ class WhisperOnnxFiles:
     decoder_path: Path
 
     @classmethod
-    def resolve(cls, model_path: Path) -> WhisperOnnxFiles:
+    def resolve(cls, model_path: Path, *, variant: str = "fp32") -> WhisperOnnxFiles:
         if model_path.is_dir():
             onnx_dir = model_path / "onnx"
             return cls(
                 root=model_path,
-                encoder_path=_first_existing(
-                    onnx_dir,
-                    (
-                        "encoder_model_int8.onnx",
-                        "encoder_model_quantized.onnx",
-                        "encoder_model.onnx",
-                    ),
-                ),
-                decoder_path=_first_existing(
-                    onnx_dir,
-                    (
-                        "decoder_model_merged_int8.onnx",
-                        "decoder_model_merged_quantized.onnx",
-                        "decoder_model_merged.onnx",
-                    ),
-                ),
+                encoder_path=_first_existing(onnx_dir, _encoder_candidates(variant)),
+                decoder_path=_first_existing(onnx_dir, _decoder_candidates(variant)),
             )
 
         raise ModelNotReadyError(
@@ -70,7 +56,10 @@ class WhisperOnnxTranscriber(SpeechToTextModel):
         if self._runner is not None:
             return
 
-        self._files = WhisperOnnxFiles.resolve(self._config.model_path)
+        self._files = WhisperOnnxFiles.resolve(
+            self._config.model_path,
+            variant=self._config.onnx_variant,
+        )
         self._encoder = self._session_factory.create(
             self._files.encoder_path,
             label="whisper-stt-encoder",
@@ -111,7 +100,10 @@ class WhisperOnnxDebugTranscriber(SpeechToTextModel):
         if self._runner is not None:
             return
 
-        files = WhisperOnnxFiles.resolve(self._config.model_path)
+        files = WhisperOnnxFiles.resolve(
+            self._config.model_path,
+            variant=self._config.onnx_variant,
+        )
         ort = self._import_onnxruntime()
         session_options = ort.SessionOptions()
         session_options.log_severity_level = 4
@@ -211,7 +203,10 @@ class WhisperOnnxRunner:
                 if session_input.name in inputs:
                     continue
                 if past is None:
-                    inputs[session_input.name] = np.zeros((1, 6, 0, 64), dtype=np.float32)
+                    inputs[session_input.name] = _empty_past_tensor(
+                        session_input.shape,
+                        batch_size=input_ids.shape[0],
+                    )
                 else:
                     inputs[session_input.name] = past[session_input.name]
 
@@ -226,6 +221,10 @@ class WhisperOnnxRunner:
                 break
 
             generated.append(token_id)
+            trimmed = _trim_repeated_suffix(generated)
+            if len(trimmed) < len(generated):
+                generated = trimmed
+                break
             past = {
                 output.name.replace("present", "past_key_values"): value
                 for output, value in zip(self._decoder_session.get_outputs()[1:], outputs[1:])
@@ -235,19 +234,46 @@ class WhisperOnnxRunner:
         return generated
 
     def _initial_prompt_ids(self) -> list[int]:
+        forced_decoder_ids = self._generation_config.get("forced_decoder_ids", [])
         language_token = f"<|{self._config.language}|>"
         lang_to_id = self._generation_config.get("lang_to_id", {})
-        if language_token not in lang_to_id:
-            raise ModelNotReadyError(
-                f"Whisper language {self._config.language!r} is not available in generation_config.json"
-            )
+        prompt_ids = self._context_prompt_ids()
+        prompt_ids.append(int(self._generation_config["decoder_start_token_id"]))
 
-        return [
-            int(self._generation_config["decoder_start_token_id"]),
-            int(lang_to_id[language_token]),
-            int(self._generation_config["task_to_id"]["transcribe"]),
-            int(self._generation_config["no_timestamps_token_id"]),
-        ]
+        if forced_decoder_ids:
+            for _position, token_id in sorted(forced_decoder_ids, key=lambda item: item[0]):
+                if token_id is None:
+                    if language_token not in lang_to_id:
+                        continue
+                    token_id = lang_to_id[language_token]
+                token = int(token_id)
+                if token not in prompt_ids:
+                    prompt_ids.append(token)
+        else:
+            if language_token in lang_to_id:
+                prompt_ids.append(int(lang_to_id[language_token]))
+            task_to_id = self._generation_config.get("task_to_id", {})
+            if "transcribe" in task_to_id:
+                prompt_ids.append(int(task_to_id["transcribe"]))
+
+        no_timestamps_token_id = self._generation_config.get("no_timestamps_token_id")
+        if no_timestamps_token_id is not None:
+            token = int(no_timestamps_token_id)
+            if token not in prompt_ids:
+                prompt_ids.append(token)
+
+        return prompt_ids
+
+    def _context_prompt_ids(self) -> list[int]:
+        prompt = self._config.prompt.strip()
+        if not prompt:
+            return []
+        prev_sot_token_id = self._generation_config.get("prev_sot_token_id")
+        if prev_sot_token_id is None:
+            return []
+        encoded = self._tokenizer.encode(prompt, add_special_tokens=False)
+        max_prompt_tokens = 96
+        return [int(prev_sot_token_id), *[int(token) for token in encoded[-max_prompt_tokens:]]]
 
     @staticmethod
     def _load_generation_config(model_root: Path) -> dict[str, Any]:
@@ -284,6 +310,30 @@ def _first_existing(root: Path, names: tuple[str, ...]) -> Path:
     )
 
 
+def _encoder_candidates(variant: str) -> tuple[str, ...]:
+    if variant == "fp32":
+        return ("encoder_model.onnx",)
+    if variant == "int8":
+        return ("encoder_model_int8.onnx", "encoder_model_quantized.onnx")
+    if variant == "auto":
+        return ("encoder_model.onnx", "encoder_model_int8.onnx", "encoder_model_quantized.onnx")
+    raise ModelNotReadyError(f"Unsupported Whisper ONNX variant: {variant}")
+
+
+def _decoder_candidates(variant: str) -> tuple[str, ...]:
+    if variant == "fp32":
+        return ("decoder_model_merged.onnx",)
+    if variant == "int8":
+        return ("decoder_model_merged_int8.onnx", "decoder_model_merged_quantized.onnx")
+    if variant == "auto":
+        return (
+            "decoder_model_merged.onnx",
+            "decoder_model_merged_int8.onnx",
+            "decoder_model_merged_quantized.onnx",
+        )
+    raise ModelNotReadyError(f"Unsupported Whisper ONNX variant: {variant}")
+
+
 def _prepare_audio(audio: AudioBuffer) -> np.ndarray:
     samples = np.asarray(audio.samples, dtype=np.float32)
     if samples.ndim > 1:
@@ -303,6 +353,31 @@ def _resample_linear(samples: np.ndarray, source_rate: int, target_rate: int) ->
     source_axis = np.linspace(0.0, duration_s, num=samples.shape[0], endpoint=False)
     target_axis = np.linspace(0.0, duration_s, num=output_count, endpoint=False)
     return np.interp(target_axis, source_axis, samples).astype(np.float32)
+
+
+def _empty_past_tensor(shape: list[Any], *, batch_size: int) -> np.ndarray:
+    resolved_shape: list[int] = []
+    for dimension in shape:
+        if dimension == "batch_size":
+            resolved_shape.append(batch_size)
+        elif isinstance(dimension, int):
+            resolved_shape.append(dimension)
+        elif isinstance(dimension, str) and "sequence_length" in dimension:
+            resolved_shape.append(0)
+        else:
+            raise ModelNotReadyError(f"Unsupported dynamic decoder cache dimension: {dimension!r}")
+    return np.zeros(tuple(resolved_shape), dtype=np.float32)
+
+
+def _trim_repeated_suffix(token_ids: list[int]) -> list[int]:
+    for ngram_size in range(12, 2, -1):
+        if len(token_ids) < ngram_size * 2:
+            continue
+        previous = token_ids[-(ngram_size * 2) : -ngram_size]
+        current = token_ids[-ngram_size:]
+        if previous == current:
+            return token_ids[:-ngram_size]
+    return token_ids
 
 
 def _suppress_logits(logits: np.ndarray, token_ids: set[int]) -> None:

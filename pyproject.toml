@@ -23,7 +23,7 @@ directml = [
 ]
 qnn = [
   "onnx>=1.17",
-  "onnxruntime-qnn>=1.18; platform_system == 'Windows'",
+  "onnxruntime-qnn>=2.2; platform_system == 'Windows'",
 ]
 dev = [
   "ruff>=0.8",

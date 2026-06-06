@@ -3,7 +3,9 @@ from __future__ import annotations
 import unittest
 
 from whispertome.config import RuntimeConfig
-from whispertome.errors import NpuVerificationError
+from whispertome.errors import NpuVerificationError, RuntimeUnavailableError
+from whispertome.runtime.base import RuntimeProvider
+from whispertome.runtime.onnx_session import NpuOnlyOnnxSessionFactory
 from whispertome.runtime.providers import ProviderResolver
 
 
@@ -50,7 +52,38 @@ class RuntimeProviderTests(unittest.TestCase):
         self.assertEqual(provider.onnx_name, "DmlExecutionProvider")
         self.assertEqual(provider.options["device_id"], 0)
 
+    def test_qnn_plugin_session_may_report_cpu_with_fallback_disabled(self) -> None:
+        provider = RuntimeProvider(
+            key="qnn_htp",
+            onnx_name="QNNExecutionProvider",
+            options={},
+            npu_verified=True,
+            proof="test",
+            ep_devices=(object(),),
+        )
+
+        NpuOnlyOnnxSessionFactory._assert_no_forbidden_fallback(
+            ("QNNExecutionProvider", "CPUExecutionProvider"),
+            provider,
+            "test-model",
+        )
+
+    def test_non_plugin_session_rejects_cpu_provider_listing(self) -> None:
+        provider = RuntimeProvider(
+            key="directml",
+            onnx_name="DmlExecutionProvider",
+            options={},
+            npu_verified=True,
+            proof="test",
+        )
+
+        with self.assertRaises(RuntimeUnavailableError):
+            NpuOnlyOnnxSessionFactory._assert_no_forbidden_fallback(
+                ("DmlExecutionProvider", "CPUExecutionProvider"),
+                provider,
+                "test-model",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
-

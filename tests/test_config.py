@@ -41,6 +41,42 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(updated.wake.phrases, ("computer", "hello dashboard"))
 
+    def test_voice_defaults_are_latency_oriented(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_openai_max = os.environ.pop("OPENAI_MAX_OUTPUT_TOKENS", None)
+            old_stt_max = os.environ.pop("WHISPERTOME_STT_MAX_TOKENS", None)
+            old_stt_variant = os.environ.pop("WHISPERTOME_STT_ONNX_VARIANT", None)
+            old_stt_prompt = os.environ.pop("WHISPERTOME_STT_PROMPT", None)
+            try:
+                config = load_config(Path(tmp), require_openai_key=False)
+            finally:
+                if old_openai_max is not None:
+                    os.environ["OPENAI_MAX_OUTPUT_TOKENS"] = old_openai_max
+                if old_stt_max is not None:
+                    os.environ["WHISPERTOME_STT_MAX_TOKENS"] = old_stt_max
+                if old_stt_variant is not None:
+                    os.environ["WHISPERTOME_STT_ONNX_VARIANT"] = old_stt_variant
+                if old_stt_prompt is not None:
+                    os.environ["WHISPERTOME_STT_PROMPT"] = old_stt_prompt
+
+            self.assertEqual(config.openai.max_output_tokens, 96)
+            self.assertEqual(config.stt.backend, "qai_whisper")
+            self.assertEqual(config.stt.max_tokens, 64)
+            self.assertEqual(config.stt.onnx_variant, "fp32")
+            self.assertIn("exact words", config.stt.prompt)
+            self.assertEqual(
+                config.stt.model_path,
+                Path(tmp)
+                / "models"
+                / "qai"
+                / "whisper_small"
+                / "snapdragon_x2_elite"
+                / "precompiled_qnn_onnx"
+                / "extracted"
+                / "whisper_small-precompiled_qnn_onnx-float-qualcomm_snapdragon_x2_elite",
+            )
+            self.assertEqual(config.audio.pre_roll_ms, 600)
+
 
 if __name__ == "__main__":
     unittest.main()

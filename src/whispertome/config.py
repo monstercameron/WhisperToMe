@@ -7,6 +7,31 @@ from pathlib import Path
 from whispertome.errors import ConfigError
 
 
+DEFAULT_OPENAI_SYSTEM_PROMPT = """
+You are WhisperToMe, a concise spoken assistant in an always-listening voice loop.
+
+The user text you receive is a speech-to-text transcript, not typed text. It may contain
+missing punctuation, casing errors, homophones, repeated words, partial phrases, or
+small recognition mistakes. Infer the most likely intent from context, but ask one short
+clarifying question when a transcript is ambiguous enough that acting would be risky.
+
+Respond for text-to-speech:
+- Keep answers brief, natural, and easy to say out loud.
+- Prefer one to three short sentences unless the user asks for detail.
+- Do not mention transcription errors unless they change the meaning.
+- Avoid markdown tables, code blocks, bullet-heavy formatting, URLs, and visual layout.
+- When the user is dictating text to be written, preserve their wording as much as possible
+  and lightly repair punctuation and obvious speech-recognition errors.
+- When the user gives a command, answer with the result or the next useful question.
+""".strip()
+
+
+DEFAULT_STT_PROMPT = (
+    "Casual spoken voice assistant commands and dictation. Transcribe the exact words, "
+    "including slang, profanity, sexual words, unusual phrases, names, and homophones."
+)
+
+
 def _parse_dotenv_line(line: str) -> tuple[str, str] | None:
     stripped = line.strip()
     if not stripped or stripped.startswith("#") or "=" not in stripped:
@@ -94,6 +119,7 @@ class OpenAIConfig:
     model: str
     system_prompt: str
     max_output_tokens: int | None
+    stateful: bool
 
 
 @dataclass(frozen=True)
@@ -124,6 +150,8 @@ class STTConfig:
     model_path: Path
     language: str
     max_tokens: int
+    onnx_variant: str
+    prompt: str
 
 
 @dataclass(frozen=True)
@@ -168,8 +196,10 @@ def load_config(project_root: Path | None = None, *, require_openai_key: bool = 
     if require_openai_key and not api_key:
         raise ConfigError("OPENAI_API_KEY is missing. Put it in .env or the process environment.")
 
-    max_output_raw = _env("OPENAI_MAX_OUTPUT_TOKENS")
-    max_output_tokens = int(max_output_raw) if max_output_raw else None
+    max_output_tokens = _env_int("OPENAI_MAX_OUTPUT_TOKENS", 96)
+    stt_onnx_variant = _env("WHISPERTOME_STT_ONNX_VARIANT", "fp32") or "fp32"
+    if stt_onnx_variant not in {"fp32", "int8", "auto"}:
+        raise ConfigError("WHISPERTOME_STT_ONNX_VARIANT must be fp32, int8, or auto")
 
     return AppConfig(
         project_root=root,
@@ -178,10 +208,11 @@ def load_config(project_root: Path | None = None, *, require_openai_key: bool = 
             model=_env("OPENAI_MODEL", "gpt-5.2") or "gpt-5.2",
             system_prompt=_env(
                 "OPENAI_SYSTEM_PROMPT",
-                "You are WhisperToMe: concise, useful, and conversational.",
+                DEFAULT_OPENAI_SYSTEM_PROMPT,
             )
-            or "You are WhisperToMe: concise, useful, and conversational.",
+            or DEFAULT_OPENAI_SYSTEM_PROMPT,
             max_output_tokens=max_output_tokens,
+            stateful=_env_bool("OPENAI_STATEFUL", True),
         ),
         runtime=RuntimeConfig(
             provider_order=_env_list("WHISPERTOME_PROVIDER_ORDER", ("directml", "qnn_htp")),
@@ -198,18 +229,24 @@ def load_config(project_root: Path | None = None, *, require_openai_key: bool = 
             vad_rms_threshold=_env_float("WHISPERTOME_VAD_RMS_THRESHOLD", 0.012),
             speech_start_ms=_env_int("WHISPERTOME_SPEECH_START_MS", 150),
             speech_end_ms=_env_int("WHISPERTOME_SPEECH_END_MS", 700),
-            pre_roll_ms=_env_int("WHISPERTOME_PRE_ROLL_MS", 300),
+            pre_roll_ms=_env_int("WHISPERTOME_PRE_ROLL_MS", 600),
             max_utterance_ms=_env_int("WHISPERTOME_MAX_UTTERANCE_MS", 15000),
         ),
         stt=STTConfig(
-            backend=_env("WHISPERTOME_STT_BACKEND", "whisper_onnx") or "whisper_onnx",
+            backend=_env("WHISPERTOME_STT_BACKEND", "qai_whisper") or "qai_whisper",
             model_path=_env_path(
                 "WHISPERTOME_STT_MODEL_PATH",
                 root,
-                "models/whisper/whisper-tiny",
+                (
+                    "models/qai/whisper_small/snapdragon_x2_elite/precompiled_qnn_onnx/"
+                    "extracted/whisper_small-precompiled_qnn_onnx-float-"
+                    "qualcomm_snapdragon_x2_elite"
+                ),
             ),
             language=_env("WHISPERTOME_STT_LANGUAGE", "en") or "en",
-            max_tokens=_env_int("WHISPERTOME_STT_MAX_TOKENS", 96),
+            max_tokens=_env_int("WHISPERTOME_STT_MAX_TOKENS", 64),
+            onnx_variant=stt_onnx_variant,
+            prompt=_env("WHISPERTOME_STT_PROMPT", DEFAULT_STT_PROMPT) or DEFAULT_STT_PROMPT,
         ),
         tts=TTSConfig(
             backend=_env("WHISPERTOME_TTS_BACKEND", "kokoro_onnx") or "kokoro_onnx",

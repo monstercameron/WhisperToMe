@@ -7,7 +7,12 @@ from pathlib import Path
 import numpy as np
 
 from whispertome.audio.types import AudioBuffer
-from whispertome.stt.whisper_onnx import WhisperOnnxFiles, _prepare_audio
+from whispertome.stt.whisper_onnx import (
+    WhisperOnnxFiles,
+    _empty_past_tensor,
+    _prepare_audio,
+    _trim_repeated_suffix,
+)
 
 
 class WhisperOnnxTests(unittest.TestCase):
@@ -21,9 +26,24 @@ class WhisperOnnxTests(unittest.TestCase):
             encoder.write_bytes(b"encoder")
             decoder.write_bytes(b"decoder")
 
-            files = WhisperOnnxFiles.resolve(root)
+            files = WhisperOnnxFiles.resolve(root, variant="int8")
 
             self.assertEqual(files.root, root)
+            self.assertEqual(files.encoder_path, encoder)
+            self.assertEqual(files.decoder_path, decoder)
+
+    def test_resolves_fp32_model_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            onnx_dir = root / "onnx"
+            onnx_dir.mkdir()
+            encoder = onnx_dir / "encoder_model.onnx"
+            decoder = onnx_dir / "decoder_model_merged.onnx"
+            encoder.write_bytes(b"encoder")
+            decoder.write_bytes(b"decoder")
+
+            files = WhisperOnnxFiles.resolve(root, variant="fp32")
+
             self.assertEqual(files.encoder_path, encoder)
             self.assertEqual(files.decoder_path, decoder)
 
@@ -33,6 +53,20 @@ class WhisperOnnxTests(unittest.TestCase):
 
         self.assertEqual(prepared.dtype, np.float32)
         self.assertEqual(prepared.shape, (16_000,))
+
+    def test_empty_past_tensor_uses_model_attention_head_count(self) -> None:
+        tensor = _empty_past_tensor(
+            ["batch_size", 8, "past_decoder_sequence_length", 64],
+            batch_size=1,
+        )
+
+        self.assertEqual(tensor.shape, (1, 8, 0, 64))
+        self.assertEqual(tensor.dtype, np.float32)
+
+    def test_trim_repeated_suffix_removes_looped_tokens(self) -> None:
+        token_ids = [1, 2, 3, 4, 5, 3, 4, 5]
+
+        self.assertEqual(_trim_repeated_suffix(token_ids), [1, 2, 3, 4, 5])
 
 
 if __name__ == "__main__":

@@ -78,7 +78,7 @@ class NpuOnlyOnnxSessionFactory:
                 providers=providers,
             )
         session_providers = tuple(session.get_providers())
-        self._assert_no_forbidden_fallback(session_providers, provider.onnx_name, label)
+        self._assert_no_forbidden_fallback(session_providers, provider, label)
 
         return OnnxSessionHandle(
             session=session,
@@ -90,20 +90,27 @@ class NpuOnlyOnnxSessionFactory:
     @staticmethod
     def _assert_no_forbidden_fallback(
         session_providers: tuple[str, ...],
-        selected_provider: str,
+        provider: RuntimeProvider,
         label: str,
     ) -> None:
+        selected_provider = provider.onnx_name
         if selected_provider not in session_providers:
             raise RuntimeUnavailableError(
                 f"{label} session did not use requested provider {selected_provider}. "
                 f"Session providers: {session_providers}"
             )
 
-        forbidden = (FORBIDDEN_PROVIDERS - {selected_provider}).intersection(session_providers)
+        forbidden_providers = FORBIDDEN_PROVIDERS - {selected_provider}
+        if selected_provider == "QNNExecutionProvider" and provider.ep_devices:
+            # ORT still reports CPUExecutionProvider in plugin-QNN sessions even with
+            # session.disable_cpu_ep_fallback=1. Session creation is the enforcement point.
+            forbidden_providers = forbidden_providers - {"CPUExecutionProvider"}
+
+        forbidden = forbidden_providers.intersection(session_providers)
         if forbidden:
             raise RuntimeUnavailableError(
                 f"{label} session includes forbidden fallback providers: {sorted(forbidden)}"
-        )
+            )
 
     @staticmethod
     def _create_session(

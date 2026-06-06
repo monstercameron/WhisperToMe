@@ -27,6 +27,7 @@ Microphone
 ## Current Decisions
 
 - STT: Whisper.
+- STT NPU path: Qualcomm AI Hub Whisper-Small precompiled QNN ONNX for Snapdragon X2 Elite.
 - TTS: Kokoro-82M v1.0 ONNX as the first candidate.
 - TTS fallback: KittenTTS Nano ONNX if Kokoro is too heavy for the target device.
 - Runtime: ONNX Runtime-based local inference.
@@ -51,12 +52,13 @@ DirectML by itself is not a guaranteed NPU path; it is a broad Windows hardware 
 
 ### Speech-to-Text
 
-Use Whisper locally for transcription. Start with the smallest Whisper variant that is accurate enough for the microphone setup, then scale up only if accuracy is poor.
+Use Whisper locally for transcription. The current working NPU path is Qualcomm AI Hub's compiled Whisper-Small artifact for this Snapdragon X2 Elite machine.
 
 Initial candidates:
 
-- `whisper-tiny` for latency testing.
-- `whisper-base` for a better quality baseline.
+- `qai_whisper` with Qualcomm AI Hub Whisper-Small precompiled QNN ONNX. This is the current STT default.
+- `whisper-base` as the current debug-quality baseline.
+- `whisper-tiny` for latency testing when accuracy is acceptable.
 - ONNX-exported Whisper model for verified Windows NPU and QNN experiments.
 
 ### Text-to-Speech
@@ -127,11 +129,20 @@ python -m venv .venv
 pip install -e .[directml]
 ```
 
-For Snapdragon/QNN testing, use a Windows ARM64 Python 3.11 environment and install:
+For Snapdragon/QNN testing, use a Windows ARM64 Python environment with an
+`onnxruntime-qnn` wheel available. This machine is using Python 3.12 ARM64.
 
 ```powershell
 pip install -e .[qnn]
 ```
+
+The current STT artifact lives under:
+
+```text
+models/qai/whisper_small/snapdragon_x2_elite/precompiled_qnn_onnx/extracted/whisper_small-precompiled_qnn_onnx-float-qualcomm_snapdragon_x2_elite
+```
+
+That folder must contain `encoder.onnx`, `decoder.onnx`, `encoder_qairt_context.bin`, and `decoder_qairt_context.bin`.
 
 The `.env` file is read automatically. The app only reports whether `OPENAI_API_KEY` is present; it does not print the key.
 
@@ -193,16 +204,48 @@ whispertome --project-root C:\Users\mreca\Desktop\whispertome test-stt --wav art
 whispertome --project-root C:\Users\mreca\Desktop\whispertome test-stt --record-ms 3000
 ```
 
-Under the NPU-only policy these commands must fail if ONNX Runtime cannot place the entire Whisper graph on the selected NPU execution provider.
+Under the NPU-only policy these commands must fail if ONNX Runtime cannot place the Qualcomm Whisper graph on the QNN NPU plugin execution provider. ONNX Runtime may still list `CPUExecutionProvider` in the session metadata; the app disables CPU fallback during session creation.
 
-For an audible/debug transcription smoke test while the NPU export is still blocked, use the explicit debug override:
+For the older `whisper_onnx` baseline, use the explicit debug override:
 
 ```powershell
 whispertome --project-root C:\Users\mreca\Desktop\whispertome test-stt --wav artifacts\tts-debug.wav --allow-non-npu
 whispertome --project-root C:\Users\mreca\Desktop\whispertome test-stt --record-ms 3000 --allow-non-npu
 ```
 
-That command intentionally does not prove NPU execution; it exists only so microphone/file input, Whisper preprocessing, decoding, and tokenizer output can be tested.
+The debug override intentionally does not prove NPU execution; it exists only so microphone/file input, Whisper preprocessing, decoding, and tokenizer output can be tested.
+
+Test the OpenAI Responses API layer with a dictation-style transcript:
+
+```powershell
+whispertome --project-root C:\Users\mreca\Desktop\whispertome test-openai "rite a short reminder to call alex tomorrow"
+```
+
+The OpenAI layer uses the Responses API by default. It sends a dictation-aware system prompt every turn, wraps STT text as a speech transcript, and keeps `previous_response_id` when `OPENAI_STATEFUL=true`.
+
+Run a full turn-based conversation demo:
+
+```powershell
+whispertome --project-root C:\Users\mreca\Desktop\whispertome demo --allow-non-npu --save-audio
+```
+
+Press Enter to start listening, then speak. The app records until a speech pause or the `--record-ms` maximum, transcribes the speech, sends the transcript through OpenAI, synthesizes the assistant response, and plays it through the speakers. Type `q` or `quit` at the prompt to exit.
+
+The `demo` command writes a log file automatically under `artifacts\logs\demo-*.log`. Use `--log-file artifacts\logs\my-demo.log` to choose a stable path. `--save-audio` writes each user recording and assistant TTS WAV under `artifacts\demo\...` so failed transcriptions and playback issues can be debugged later.
+
+The current full demo requires `--allow-non-npu` because the downloaded Whisper and Kokoro ONNX artifacts still fail strict QNN NPU placement. With that flag, the demo uses the explicit debug STT/TTS path so conversation testing stays responsive. Without that flag, the demo keeps the production policy strict and fails instead of silently using CPU or GPU execution.
+
+Performance-oriented demo options:
+
+```powershell
+whispertome --project-root C:\Users\mreca\Desktop\whispertome demo --allow-non-npu --save-audio --record-ms 8000
+whispertome --project-root C:\Users\mreca\Desktop\whispertome demo --allow-non-npu --save-audio --vad-threshold 0.02
+whispertome --project-root C:\Users\mreca\Desktop\whispertome demo --allow-non-npu --save-audio --fixed-record --record-ms 3000
+```
+
+The default demo warms the debug STT/TTS models before the first turn, skips silent or very short captures, logs audio energy and clipping, and emits a `demo_turn_profile` line for each turn plus a `demo_profile_summary` at the end. If logs show `demo_audio_clipping`, lower the microphone input gain or move farther from the microphone; clipped speech will hurt Whisper accuracy.
+
+For STT quality testing, the demo transcribes the raw speech-pause capture instead of the trimmed diagnostic clip. This keeps the front of short utterances intact while still avoiding the old fixed five-second recording delay. `turn-*-user.wav` and `turn-*-raw.wav` are both saved when `--save-audio` is enabled.
 
 ## Current Build Status
 
@@ -215,12 +258,16 @@ Implemented:
 - Continuous STT-oriented voice loop.
 - Sliding transcript wake phrase detection with arbitrary wake phrases.
 - Speech-pause-delimited command capture after wake detection.
+- OpenAI Responses API client with a dictation-aware system prompt and stateful response chaining.
 - Strict NPU-only ONNX Runtime provider selection.
 - `doctor` command for safe config and runtime checks.
 - `test-wake` command for wake phrase routing tests without microphone/model access.
 - `test-tts` command for TTS initialization and WAV generation.
 - `test-audio` command for speaker playback checks without any model inference.
 - `test-stt` command for WAV-file and short microphone transcription checks.
+- `test-openai` command for Responses API smoke tests.
+- `demo` command for microphone -> STT -> OpenAI -> TTS -> speaker conversation testing with per-run logs.
+- Speech-pause-delimited demo recording with stage-level profiling and clipping warnings.
 - Whisper ONNX split encoder/decoder adapter with Hugging Face feature extraction and tokenizer decoding.
 - Kokoro ONNX TTS adapter using the real `kokoro-onnx` tokenizer, phonemizer, voices, and injected NPU-only ONNX session.
 - Unit tests for config, wake phrase detection, and provider policy.
@@ -249,14 +296,28 @@ The next TTS artifact must be one of:
 
 ### STT Status
 
-The project is currently configured for `onnx-community/whisper-tiny` split ONNX artifacts:
+The project is currently configured for `onnx-community/whisper-base` split ONNX artifacts, with `onnx-community/whisper-small.en` downloaded for slower English-only comparison tests:
 
 ```text
-models/whisper/whisper-tiny/onnx/encoder_model_int8.onnx
-models/whisper/whisper-tiny/onnx/decoder_model_merged_int8.onnx
+models/whisper/whisper-base/onnx/encoder_model_int8.onnx
+models/whisper/whisper-base/onnx/decoder_model_merged_int8.onnx
+models/whisper/whisper-small.en/onnx/encoder_model_int8.onnx
+models/whisper/whisper-small.en/onnx/decoder_model_merged_int8.onnx
 ```
 
-The adapter can run a debug transcription using `CPUExecutionProvider`, but ONNX Runtime QNN does not claim every node in the encoder or decoder graph. Because CPU fallback is disabled, strict NPU STT fails fast with a policy error.
+The adapter can run a debug transcription using `CPUExecutionProvider`, but ONNX Runtime QNN does not claim every node in the encoder or decoder graph. Because CPU fallback is disabled, strict NPU STT fails fast with a policy error. The debug decoder now derives cache shapes from the ONNX graph, supports English-only forced prompts, and trims obvious repeated-token loops.
+
+### OpenAI Status
+
+The OpenAI layer is wired through the Responses API:
+
+- `instructions` carries the dictation-aware system prompt.
+- `input` is a user message containing the speech-to-text transcript.
+- `previous_response_id` is used for stateful turns when enabled.
+- `test-openai` verifies the API key, selected model, prompt, and response parsing.
+- Spoken replies default to `OPENAI_MAX_OUTPUT_TOKENS=96` unless overridden.
+
+Realtime/WebSocket is not the default path yet. It remains the right future option if we switch to lower-latency cloud speech-to-speech or realtime audio transcription, but the current architecture keeps local STT/TTS plus a text Responses API turn.
 
 ## Research Notes
 
@@ -285,5 +346,7 @@ Prioritize a working voice loop first, then optimize model placement and NPU acc
 - Whisper: https://github.com/openai/whisper
 - Kokoro-82M v1.0 ONNX: https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX
 - KittenTTS Nano ONNX: https://huggingface.co/onnx-community/KittenTTS-Nano-v0.8-ONNX
+- OpenAI Responses API: https://platform.openai.com/docs/api-reference/responses
+- OpenAI Realtime API: https://platform.openai.com/docs/guides/realtime
 - ONNX Runtime DirectML Execution Provider: https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html
 - ONNX Runtime QNN Execution Provider: https://onnxruntime.ai/docs/execution-providers/QNN-ExecutionProvider.html
