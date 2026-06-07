@@ -809,6 +809,16 @@ def run_desktop(config: AppConfig, args: argparse.Namespace) -> int:
     if args.tui_lines < 1 or args.tui_lines > 10:
         raise WhisperToMeError("tui-lines must be between 1 and 10")
 
+    # Check for models on disk; offer to download (popup) before launching the child loop.
+    if not getattr(args, "allow_non_npu", False):
+        from whispertome.models.downloader import ensure_models_present
+
+        if not ensure_models_present(config, gui=True):
+            raise WhisperToMeError(
+                "Required models are missing and were not downloaded. "
+                "Re-run and accept the download, or place models under the project root."
+            )
+
     from whispertome.desktop.host import (
         DesktopHostConfig,
         DesktopTerminalHost,
@@ -928,6 +938,19 @@ def run_wake_loop(
         raise WhisperToMeError("tui-lines must be between 1 and 10")
 
     logger = logging.getLogger(__name__)
+
+    # Filesystem check for models; offer to download (popup / console) if missing. Skipped
+    # under --allow-non-npu (debug paths may use other artifacts). Idempotent: if the desktop
+    # host already downloaded them, this returns immediately.
+    if not allow_non_npu:
+        from whispertome.models.downloader import ensure_models_present
+
+        if not ensure_models_present(config, gui=True):
+            raise WhisperToMeError(
+                "Required models are missing and were not downloaded. "
+                "Re-run and accept the download, or place models under the project root."
+            )
+
     active_vad_threshold = (
         config.audio.vad_rms_threshold if vad_threshold is None else vad_threshold
     )
