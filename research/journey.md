@@ -1111,3 +1111,100 @@ in config, wired into run_wake_loop (note_turn per turn, start/stop, on the shar
 CRITICAL fix found during impl: note_turn runs inside a turn that already holds turn_lock, and the
 usage trigger re-acquires it -> self-deadlock. Made turn_lock an RLock (reentrant for same-thread,
 still mutually exclusive across the scheduler/idle threads); added a regression test. 160 tests pass.
+
+## Milestone 37: Idle power / battery sipping + NPU burst latency
+
+Goal: sip battery while idle/listening on a fanless ARM laptop, stay low-latency and reactive.
+Method was measure-first throughout: added `scripts/measure_idle.py` (psutil) which samples the
+whole process tree's CPU% and **context-switches/sec** — on a fanless device, energy tracks
+CPU-active-time + how often the cores are woken out of deep idle, so ctx/s is the reliable
+wakeup proxy (CPU% jitters with background load). It also does per-process and `--threads <pid>`
+breakdowns; results append to `artifacts/idle_measurements.jsonl` for A/B.
+
+Five levers, each measured against the running app (idle = listening for the wake word):
+
+1. **TUI frame dedup + frozen idle animation + minute clock** (`ui/terminal.py`). The render
+   loop now skips the write when the frame is byte-identical to the last; the animation frame
+   counter is frozen when nothing is animating (so idle frames ARE identical); a deep-idle tier
+   backs the loop off further (a real state change still wakes it instantly via the event). The
+   header clock dropped from `%H:%M:%S` to `%H:%M` — the seconds field was forcing a full repaint
+   every second, defeating all of the above. In desktop mode each skipped frame also avoids the
+   ANSI-parse -> widget-insert -> drain cascade.
+2. **Adaptive desktop drain + merged signal poll** (`desktop/host.py`). The output drain was a
+   62 Hz (`after(16ms)`) timer that fired forever even with zero output — the single biggest
+   wakeup sink. Now it polls fast (16 ms) only while bytes flow and relaxes to 200 ms after a
+   short empty streak (snaps back instantly on data; child-exit still caught promptly). The two
+   120 ms signal-file pollers (wake event + window command) merged into one 150 ms tick.
+3. **Audio block 30 -> 64 ms** (`config.py`, `WHISPERTOME_AUDIO_BLOCK_MS`). Always-on capture is
+   the dominant idle cost: each block is a callback->queue->VAD wakeup, so block rate ~= idle
+   wakeup rate. 64 ms (~16 Hz vs 33 Hz) more than halved voice-loop idle CPU. Cost: ~34 ms added
+   speech-onset detection — imperceptible next to min_speech_ms (250) + STT.
+4. **ORT CPU thread pools capped to 1** (`runtime/onnx_session.py`, `config.py`). Per-thread
+   profiling exposed ~200 threads in the voice loop, only ~5 doing work: ONNX Runtime spawns a
+   ~core-count CPU thread pool PER session, and Supertonic alone has 12 (4 stages x 3 frame
+   buckets) + Whisper. Under the NPU-only policy (`disable_cpu_ep_fallback=1`) there are no CPU
+   nodes, so those pools were pure overhead (idle-spin + ~1 MB stack each). Capping intra/inter-op
+   to 1 dropped the worker to 39 threads and cut idle CPU further.
+5. **HTP burst clocking** (`config.py` `htp_performance_mode=burst`, applied in the QNN session
+   factory). The Hexagon sessions were running at the conservative default clock. Burst ramps the
+   clock hard for the short inference burst then returns to idle ("race to idle"). Output is
+   numerically identical (just faster), so no quality change, and idle power is unaffected (the
+   NPU still idles between turns). Tested `htp_graph_finalization_optimization_mode=3` too and
+   REMOVED it: proved a no-op here because it's a compile-time option and our contexts are
+   pre-compiled/cached. Whisper STT shares the factory, so it gets the same speedup.
+
+Measured results (idle, reproducible on the ctx/s metric; CPU% is noisier on a live desktop):
+- Total idle wakeups: **246 -> ~155 ctx/s (-37%)**; voice-loop **163 -> ~107 ctx/s (-34%)**.
+- Voice-loop threads: **~200 -> 39 (-80%)**; the ORT thread cap also removed idle-spin (a clean
+  64 ms + thread-cap reading hit 0.5% one-core voice-loop CPU, ~0.04% system-wide).
+- TTS NPU latency (Supertonic, two-sentence phrase): **~340 ms -> ~190 ms (-44%)**, dead
+  consistent across runs; A/B isolated burst as the sole contributor. STT benefits identically.
+
+Responsiveness preserved by design: streaming/drain still snaps to 16 ms, the renderer wakes
+instantly on any state change, onset detection is only +34 ms, and every lever is env-tunable to
+dial back toward minimum latency. A critic subagent reviewed the idle diff (no CRITICAL/HIGH;
+applied its two hardening fixes: guarded `_poll_signals`, prompt child-exit detection). 168 tests
+pass (added idle dedup/reactivity, NPU efficiency defaults, and env-override tests).
+
+We are now near the irreducible floor: the remaining ~107 ctx/s is the always-on mic + VAD, and
+the desktop host is a single Tk mainloop thread (~0.3% CPU). Further idle cuts would need
+architecture changes (a hardware/tiny wake-word model to gate the mic, or a headless tray mode
+that tears down the Tk window when not in use), not tuning.
+
+## Milestone 38: Onboarding form + password-protected secret vault
+
+First-run UX + basic at-rest credential security.
+
+Onboarding (`onboarding.py`): a Tk setup form (console fallback) collects the minimal config a new
+user needs — name, OpenAI/Cerebras provider, API key, and a password. It runs from `cli.main()`
+before any key-requiring command (run/desktop/demo/test-openai) loads config, so a fresh user can
+double-click the exe and be guided in rather than hand-editing `.env`. Name + provider go to `.env`
+(non-secret); a light "The user's name is X." line is prepended to the system prompt
+(`WHISPERTOME_USER_NAME`, new `AppConfig.user_name`).
+
+Secret vault (`security/vault.py`): the API key is encrypted at rest in a password-protected SQLite
+vault (`artifacts/secrets.sqlite`), stdlib-only crypto so it works in the frozen exe (no
+`cryptography` dependency):
+- KDF: `hashlib.scrypt(password, salt)` -> 96 bytes split into enc_key | mac_key | verifier
+  (memory-hard, n*r*128 ~= 16 MB per guess). The stored `verifier` segment is the "password hash",
+  compared in constant time on unlock.
+- Per-secret: unique random 16-byte nonce; keystream = HKDF-Expand(enc_key, nonce); ciphertext =
+  plaintext XOR keystream; encrypt-then-MAC tag = HMAC-SHA256(mac_key, nonce||ciphertext), verified
+  constant-time before decrypt (tamper detection). No AES in stdlib, so this is a careful authenticated
+  hash-based construction — basic local-at-rest protection, documented as such.
+
+Startup orchestration (`ensure_credentials_ready`): (1) key already available — legacy plaintext
+`.env`, OR injected into os.environ by a parent process — short-circuits with no prompt (critical:
+the desktop host unlocks once, then spawns the voice-loop child which inherits the env, so the child
+must not re-prompt); (2) vault initialized -> prompt to unlock (Tk dialog / getpass, 3 attempts),
+then inject decrypted secrets into os.environ for config to read; (3) nothing -> first-run onboarding.
+Backward compatible: existing plaintext `.env` setups keep working untouched.
+
+Migration: `whispertome secure` moves plaintext API keys out of `.env` into a new vault and scrubs
+them from `.env` (for users who already had plaintext keys).
+
+Verified: 185 tests pass (16 new across vault + onboarding) — encryption-at-rest (no plaintext/
+password in the .sqlite bytes), unique nonces, tamper detection, wrong-password rejection,
+change-password re-key, .env merge/scrub, legacy short-circuit, child-inherits-env no-reprompt,
+vault-unlock injection, and the secure-migration round-trip. App relaunched cleanly via the legacy
+path (no disruption to the existing plaintext setup). Tk forms smoke-tested on-device.

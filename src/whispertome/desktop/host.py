@@ -33,6 +33,14 @@ DEFAULT_FONT_SIZE = 10
 WAKE_SHOW_DEBOUNCE_S = 1.5
 GEOMETRY_TRACKING_DELAY_MS = 600
 GEOMETRY_PROGRAMMATIC_S = 0.6
+# Output mirroring is adaptive: poll fast while bytes are flowing (snappy streaming), then relax
+# to an idle cadence after a short run of empty drains so the CPU can reach deep idle while just
+# listening. The first byte after a lull costs at most one idle interval of latency.
+DRAIN_FAST_MS = 16
+DRAIN_IDLE_MS = 200
+DRAIN_BACKOFF_TICKS = 8
+# Wake-event and window-command files share one poll tick (halves the timer wakeups vs two timers).
+SIGNAL_POLL_MS = 150
 COLOR_CODES = {
     "30": "fg_black",
     "31": "fg_red",
@@ -152,6 +160,7 @@ class DesktopTerminalHost:
         self._shutdown_deadline: float | None = None
         self._last_wake_event_mtime_ns: int | None = None
         self._last_window_command_mtime_ns: int | None = None
+        self._drain_empty_ticks = 0
         self._last_show_monotonic = 0.0
         self._tracking_window_position = False
         self._programmatic_geometry_until = 0.0
@@ -246,9 +255,8 @@ class DesktopTerminalHost:
         )
         self._tray_icon.start()  # type: ignore[attr-defined]
         root.after(80, self._start_process)  # type: ignore[attr-defined]
-        root.after(16, self._drain_output)
-        root.after(120, self._poll_wake_event)
-        root.after(120, self._poll_window_command)
+        root.after(DRAIN_FAST_MS, self._drain_output)
+        root.after(SIGNAL_POLL_MS, self._poll_signals)
         root.mainloop()
         return self._process.returncode if self._process is not None else 0
 
@@ -459,12 +467,18 @@ class DesktopTerminalHost:
             chunks.append(item)
         if chunks:
             self._write_terminal(_latest_terminal_frame("".join(chunks)))
+            self._drain_empty_ticks = 0
+        else:
+            self._drain_empty_ticks += 1
         if stopped:
             self._set_status("voice loop stopped")
             if self._stop_requested:
                 self._finish_stop()
         if self._root is not None:
-            self._root.after(16, self._drain_output)  # type: ignore[attr-defined]
+            # Snap to fast polling whenever bytes are flowing; relax to the idle cadence only
+            # after a short empty streak so the cores can settle while we're just listening.
+            delay = DRAIN_FAST_MS if self._drain_empty_ticks < DRAIN_BACKOFF_TICKS else DRAIN_IDLE_MS
+            self._root.after(delay, self._drain_output)  # type: ignore[attr-defined]
 
     def _write_terminal(self, text: str) -> None:
         terminal = self._terminal
@@ -632,45 +646,59 @@ class DesktopTerminalHost:
         except Exception:
             return
 
-    def _poll_wake_event(self) -> None:
-        wake_event_file = self._config.wake_event_file
-        if wake_event_file is not None:
-            try:
-                stat = wake_event_file.stat()
-            except FileNotFoundError:
-                pass
-            except Exception as exc:
-                LOGGER.warning("desktop_wake_event_poll_failed error=%s", exc)
-            else:
-                if self._last_wake_event_mtime_ns != stat.st_mtime_ns:
-                    self._last_wake_event_mtime_ns = stat.st_mtime_ns
-                    if self._show_window():
-                        LOGGER.info("desktop_window_shown reason=wake_event")
-                    else:
-                        LOGGER.info("desktop_window_show_skipped reason=wake_event")
+    def _poll_signals(self) -> None:
+        # One tick drives both file watchers so idle costs a single timer wakeup, not two.
+        # Guard each so an unexpected throw in one can't stop the shared reschedule (which would
+        # silently kill both watchers); the chain must always re-arm.
+        try:
+            self._check_wake_event()
+            self._check_window_command()
+        except Exception as exc:  # noqa: BLE001 — never let a watcher hiccup kill the loop
+            LOGGER.warning("desktop_signal_poll_failed error=%s", exc)
+        # Catch an unsolicited child exit promptly even while the output drain is backed off:
+        # the sentinel is otherwise only seen by _drain_output, which can lag up to DRAIN_IDLE_MS.
+        if self._process is not None and self._process.poll() is not None:
+            self._drain_empty_ticks = 0
         if self._root is not None:
-            self._root.after(120, self._poll_wake_event)  # type: ignore[attr-defined]
+            self._root.after(SIGNAL_POLL_MS, self._poll_signals)  # type: ignore[attr-defined]
 
-    def _poll_window_command(self) -> None:
-        window_command_file = self._config.window_command_file
-        if window_command_file is not None:
-            try:
-                stat = window_command_file.stat()
-            except FileNotFoundError:
-                pass
-            except Exception as exc:
-                LOGGER.warning("desktop_window_command_poll_failed error=%s", exc)
+    def _check_wake_event(self) -> None:
+        wake_event_file = self._config.wake_event_file
+        if wake_event_file is None:
+            return
+        try:
+            stat = wake_event_file.stat()
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            LOGGER.warning("desktop_wake_event_poll_failed error=%s", exc)
+            return
+        if self._last_wake_event_mtime_ns != stat.st_mtime_ns:
+            self._last_wake_event_mtime_ns = stat.st_mtime_ns
+            if self._show_window():
+                LOGGER.info("desktop_window_shown reason=wake_event")
             else:
-                if self._last_window_command_mtime_ns != stat.st_mtime_ns:
-                    self._last_window_command_mtime_ns = stat.st_mtime_ns
-                    try:
-                        command = window_command_file.read_text(encoding="utf-8").strip()
-                    except Exception as exc:
-                        LOGGER.warning("desktop_window_command_read_failed error=%s", exc)
-                    else:
-                        self._handle_window_command(command)
-        if self._root is not None:
-            self._root.after(120, self._poll_window_command)  # type: ignore[attr-defined]
+                LOGGER.info("desktop_window_show_skipped reason=wake_event")
+
+    def _check_window_command(self) -> None:
+        window_command_file = self._config.window_command_file
+        if window_command_file is None:
+            return
+        try:
+            stat = window_command_file.stat()
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            LOGGER.warning("desktop_window_command_poll_failed error=%s", exc)
+            return
+        if self._last_window_command_mtime_ns != stat.st_mtime_ns:
+            self._last_window_command_mtime_ns = stat.st_mtime_ns
+            try:
+                command = window_command_file.read_text(encoding="utf-8").strip()
+            except Exception as exc:
+                LOGGER.warning("desktop_window_command_read_failed error=%s", exc)
+            else:
+                self._handle_window_command(command)
 
     def _handle_window_command(self, command: str) -> None:
         command = command.lstrip("\ufeff").strip()

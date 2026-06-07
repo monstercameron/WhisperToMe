@@ -171,6 +171,24 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(config.system.wake_duck_enabled)
             self.assertEqual(config.system.wake_duck_percent, 25)
 
+    def test_npu_runtime_efficiency_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(Path(tmp), require_openai_key=False)
+            # NPU compute is on the HTP, so ORT CPU pools are capped to keep the thread
+            # footprint small; HTP runs in burst (race-to-idle) for low-latency bursty work.
+            self.assertEqual(config.runtime.ort_intra_op_threads, 1)
+            self.assertEqual(config.runtime.ort_inter_op_threads, 1)
+            self.assertEqual(config.runtime.htp_performance_mode, "burst")
+
+    def test_htp_performance_mode_is_env_overridable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["WHISPERTOME_HTP_PERFORMANCE_MODE"] = "balanced"
+            try:
+                config = load_config(Path(tmp), require_openai_key=False)
+            finally:
+                del os.environ["WHISPERTOME_HTP_PERFORMANCE_MODE"]
+            self.assertEqual(config.runtime.htp_performance_mode, "balanced")
+
 
 if __name__ == "__main__":
     unittest.main()

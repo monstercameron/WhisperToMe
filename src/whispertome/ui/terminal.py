@@ -27,6 +27,10 @@ TUI_WIDTH_ENV = "WHISPERTOME_TUI_WIDTH"
 TUI_HEIGHT_ENV = "WHISPERTOME_TUI_HEIGHT"
 TUI_FPS_ENV = "WHISPERTOME_TUI_FPS"
 TUI_IDLE_FPS_ENV = "WHISPERTOME_TUI_IDLE_FPS"
+# When the rendered frame is byte-identical to the last one and nothing is animating, the loop
+# backs off to this rate. Real state changes wake it instantly (event-driven), so a slow deep-idle
+# tick costs nothing in reactivity — it just stops re-computing a frame that can't have changed.
+TUI_DEEP_IDLE_FPS_ENV = "WHISPERTOME_TUI_DEEP_IDLE_FPS"
 LOGGER = logging.getLogger(__name__)
 DISPLAY_TRANSLATION = str.maketrans(
     {
@@ -201,8 +205,10 @@ class TerminalVoiceUi:
         # energy on a fanless device. Both are env-tunable.
         active = fps if fps is not None else _env_float(TUI_FPS_ENV, 5.0)
         idle = idle_fps if idle_fps is not None else _env_float(TUI_IDLE_FPS_ENV, 2.0)
+        deep = _env_float(TUI_DEEP_IDLE_FPS_ENV, 0.5)
         self._fps = max(1.0, active)
         self._idle_fps = max(0.5, min(idle, self._fps))
+        self._deep_idle_fps = max(0.1, min(deep, self._idle_fps))
         self._state = TerminalUiState(max_lines=max_lines)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -285,8 +291,10 @@ class TerminalVoiceUi:
     def _render_loop(self) -> None:
         full_interval = 1.0 / self._fps
         idle_interval = 1.0 / self._idle_fps
+        deep_idle_interval = 1.0 / self._deep_idle_fps
         interval = full_interval
         last_rendered = 0.0
+        last_frame: str | None = None
         while not self._stop_event.is_set():
             timeout = max(0.0, interval - (perf_counter() - last_rendered))
             self._render_event.wait(timeout)
@@ -301,15 +309,28 @@ class TerminalVoiceUi:
                     snapshot = self._state.copy()
                 width, height = terminal_size()
                 frame = render_frame(snapshot, width=width, height=height, frame=self._frame)
-                self._write_stream("\x1b[H\x1b[2J" + frame)
+                animating = _is_animation_active(snapshot)
+                if frame != last_frame:
+                    # Only paint when the frame actually changed. Skipping byte-identical
+                    # frames avoids the terminal write (and, in desktop mode, the whole
+                    # ANSI-parse + widget-insert + drain cascade) every idle tick.
+                    self._write_stream("\x1b[H\x1b[2J" + frame)
+                    last_frame = frame
+                    interval = full_interval if animating else idle_interval
+                else:
+                    # Nothing changed. Keep ticking for animation; otherwise sink to the
+                    # deep-idle rate — a real change wakes us instantly via _render_event.
+                    interval = full_interval if animating else deep_idle_interval
+                # Advance the animation clock only while something is animating. Freezing it
+                # when idle makes the scene byte-stable so the dedup above can actually skip —
+                # and stops the slow idle "breathing" from spending cycles for no visible gain.
+                if animating:
+                    self._frame += 1
                 self._render_failures = 0
-                # Throttle the free-running animation when idle; active states keep full FPS.
-                interval = full_interval if _is_animation_active(snapshot) else idle_interval
             except Exception:
                 self._render_failures += 1
                 LOGGER.exception("terminal_tui_render_failed count=%d", self._render_failures)
                 self._write_stream(render_error_frame(*terminal_size()))
-            self._frame += 1
             last_rendered = perf_counter()
 
     def _write_stream(self, text: str) -> None:
@@ -595,7 +616,10 @@ def format_next_event(state: TerminalUiState) -> str:
 
 def render_runtime_header(state: TerminalUiState, width: int) -> list[str]:
     status = fit_plain(state.status_text.upper(), 22)
-    clock = datetime.now().strftime("%H:%M:%S")
+    # Minute resolution (not seconds): keeps the idle frame byte-identical for up to a minute so
+    # the dedup/deep-idle render path stops repainting a static screen. The live "in Xs" agenda
+    # chip still ticks per-second when an event is imminent.
+    clock = datetime.now().strftime("%H:%M")
     pipeline = "STT -> LLM -> TOOLS -> TTS"
     if width < 96:
         content = (

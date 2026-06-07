@@ -194,5 +194,43 @@ class TerminalUiTests(unittest.TestCase):
         self.assertEqual(strip_ansi_len("\x1b[31mhello\x1b[0m"), 5)
 
 
+class IdleRenderEnergyTests(unittest.TestCase):
+    """The idle render path must stop repainting a static frame, yet repaint instantly when
+    real state changes — that's the battery-vs-reactivity contract for an always-on assistant."""
+
+    def _paint_count(self, stream) -> int:
+        # Each painted frame is prefixed with the full-screen clear sequence.
+        return stream.getvalue().count("\x1b[H\x1b[2J")
+
+    def test_idle_frames_are_deduped_but_changes_repaint_promptly(self) -> None:
+        import io
+        import time
+
+        from whispertome.ui.terminal import TerminalVoiceUi
+
+        stream = io.StringIO()
+        # Fast ticks so the test is quick; "listening" is a non-animating, activity-0 status.
+        ui = TerminalVoiceUi(stream=stream, fps=60, idle_fps=60, max_lines=4)
+        ui.start()
+        try:
+            ui.status("listening")
+            time.sleep(0.2)
+            settled = self._paint_count(stream)
+            self.assertGreaterEqual(settled, 1)  # painted at least once
+
+            time.sleep(0.3)  # many idle ticks elapse with no state change
+            self.assertEqual(
+                self._paint_count(stream), settled, "static idle frame should not repaint"
+            )
+
+            ui.status("wake detected")  # a real change
+            time.sleep(0.1)
+            self.assertGreater(
+                self._paint_count(stream), settled, "a state change must repaint promptly"
+            )
+        finally:
+            ui.stop()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -33,16 +33,28 @@ class NpuOnlyOnnxSessionFactory:
         session_options.log_severity_level = 4
         session_options.enable_profiling = self._config.enable_onnx_profiling
         session_options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+        # NPU-only sessions don't run ORT's CPU op pools (compute is on the HTP), so default
+        # per-session thread pools (~core-count each) just pile up parked threads across the
+        # 12+ Supertonic/Whisper sessions. Cap them; env-tunable for the CPU-debug fallback.
+        if self._config.ort_intra_op_threads > 0:
+            session_options.intra_op_num_threads = self._config.ort_intra_op_threads
+        if self._config.ort_inter_op_threads > 0:
+            session_options.inter_op_num_threads = self._config.ort_inter_op_threads
 
         if provider.onnx_name == "QNNExecutionProvider":
             qnn_ep = self._import_onnxruntime_qnn()
             devices = self._qnn_npu_devices(ort)
             if not devices:
                 raise RuntimeUnavailableError("QNNExecutionProvider has no NPU EP device")
+            qnn_options = {"backend_path": qnn_ep.get_qnn_htp_path()}
+            # HTP burst clocking: ramps hard for the short inference burst then returns to idle
+            # (race-to-idle), cutting latency ~44% without sustained power draw. Optional via config.
+            if self._config.htp_performance_mode:
+                qnn_options["htp_performance_mode"] = self._config.htp_performance_mode
             provider = RuntimeProvider(
                 key=provider.key,
                 onnx_name=provider.onnx_name,
-                options={"backend_path": qnn_ep.get_qnn_htp_path()},
+                options=qnn_options,
                 npu_verified=provider.npu_verified,
                 proof=provider.proof,
                 ep_devices=devices,

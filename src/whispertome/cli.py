@@ -279,6 +279,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_wake_args(doctor_parser)
 
+    subparsers.add_parser(
+        "secure",
+        help="Move plaintext API keys from .env into a password-protected vault.",
+    )
+
     run_parser = subparsers.add_parser("run", help="Start the live voice loop.")
     add_wake_args(run_parser)
     add_live_loop_args(run_parser)
@@ -606,6 +611,23 @@ def main(argv: list[str] | None = None) -> int:
         logging.getLogger(__name__).info("log_file=%s", log_file)
 
     try:
+        if args.command == "secure":
+            from whispertome import onboarding
+
+            return 0 if onboarding.secure_existing_env(args.project_root, gui=False) else 1
+
+        # Credentials gate: commands that need an LLM key either run first-run setup (encrypting the
+        # key into the vault) or unlock the existing vault and inject the key — before load_config.
+        if args.command in {"run", "desktop", "demo", "test-openai"}:
+            from whispertome import onboarding
+
+            if not onboarding.ensure_credentials_ready(
+                args.project_root, gui=(args.command == "desktop")
+            ):
+                logging.getLogger(__name__).error("credentials_not_ready command=%s", args.command)
+                print("WhisperToMe needs an unlocked API key to run. Cancelled.")
+                return 1
+
         if args.command == "doctor":
             config = apply_cli_overrides(
                 load_config(args.project_root, require_openai_key=False),

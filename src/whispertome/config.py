@@ -301,6 +301,9 @@ class RuntimeConfig:
     directml_device_id: int
     directml_adapter_name: str | None
     enable_onnx_profiling: bool
+    ort_intra_op_threads: int
+    ort_inter_op_threads: int
+    htp_performance_mode: str
 
 
 @dataclass(frozen=True)
@@ -374,6 +377,7 @@ class ConversationConfig:
 @dataclass(frozen=True)
 class AppConfig:
     project_root: Path
+    user_name: str | None
     llm_provider: str
     openai: OpenAIConfig
     cerebras: CerebrasConfig
@@ -438,6 +442,7 @@ def load_config(project_root: Path | None = None, *, require_openai_key: bool = 
     if stt_onnx_variant not in {"fp32", "int8", "auto"}:
         raise ConfigError("WHISPERTOME_STT_ONNX_VARIANT must be fp32, int8, or auto")
 
+    user_name = (_env("WHISPERTOME_USER_NAME") or "").strip() or None
     openai_system_prompt = (
         _env(
             "OPENAI_SYSTEM_PROMPT",
@@ -445,11 +450,15 @@ def load_config(project_root: Path | None = None, *, require_openai_key: bool = 
         )
         or DEFAULT_OPENAI_SYSTEM_PROMPT
     )
+    if user_name:
+        # Light personalization: let the assistant address the user by name.
+        openai_system_prompt = f"The user's name is {user_name}.\n{openai_system_prompt}"
 
     provider_order = _env_list("WHISPERTOME_PROVIDER_ORDER", ("directml", "qnn_htp"))
 
     return AppConfig(
         project_root=root,
+        user_name=user_name,
         llm_provider=llm_provider,
         openai=OpenAIConfig(
             api_key=api_key,
@@ -480,11 +489,27 @@ def load_config(project_root: Path | None = None, *, require_openai_key: bool = 
             directml_device_id=_env_int("WHISPERTOME_DIRECTML_DEVICE_ID", 0),
             directml_adapter_name=_env("WHISPERTOME_DIRECTML_ADAPTER_NAME"),
             enable_onnx_profiling=_env_bool("WHISPERTOME_ONNX_PROFILING", False),
+            # NPU compute runs on the Hexagon HTP, so ORT's CPU intra/inter-op pools sit
+            # nearly idle. Each session otherwise spawns ~core-count threads; with Supertonic's
+            # 12 stage/bucket sessions + Whisper that's ~200 parked threads (~100s of MB of
+            # stacks). Capping to 1 collapses the footprint with no NPU-path latency cost.
+            ort_intra_op_threads=_env_int("WHISPERTOME_ORT_INTRA_OP_THREADS", 1),
+            ort_inter_op_threads=_env_int("WHISPERTOME_ORT_INTER_OP_THREADS", 1),
+            # Bursty TTS/STT NPU work benefits from HTP "burst": the Hexagon clock ramps hard for
+            # the short inference then drops back to idle (race-to-idle), so it lowers latency
+            # (~44% measured on Supertonic) without sustained power draw. Env-tunable; set to a
+            # blank/other value to fall back to the QNN default mode.
+            htp_performance_mode=_env("WHISPERTOME_HTP_PERFORMANCE_MODE") or "burst",
         ),
         audio=AudioConfig(
             sample_rate=_env_int("WHISPERTOME_AUDIO_SAMPLE_RATE", 16000),
             channels=_env_int("WHISPERTOME_AUDIO_CHANNELS", 1),
-            block_ms=_env_int("WHISPERTOME_AUDIO_BLOCK_MS", 30),
+            # Always-on capture is the dominant idle cost: each block is a callback->queue->VAD
+            # wakeup, so block rate ~= idle wakeup rate. 64 ms (~16 Hz vs 33 Hz at 30 ms) more
+            # than halves voice-loop idle CPU (measured 2.05% -> 0.5% with the ORT thread cap)
+            # while adding only ~34 ms to speech-onset detection — imperceptible next to
+            # min_speech_ms + STT. Drop to 30 for the finest VAD timing if you prefer.
+            block_ms=_env_int("WHISPERTOME_AUDIO_BLOCK_MS", 64),
             vad_rms_threshold=_env_float("WHISPERTOME_VAD_RMS_THRESHOLD", 0.012),
             speech_start_ms=_env_int("WHISPERTOME_SPEECH_START_MS", 150),
             speech_end_ms=_env_int("WHISPERTOME_SPEECH_END_MS", 1200),

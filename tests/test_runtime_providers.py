@@ -19,6 +19,9 @@ def runtime_config(**overrides) -> RuntimeConfig:  # type: ignore[no-untyped-def
         "directml_device_id": 0,
         "directml_adapter_name": None,
         "enable_onnx_profiling": False,
+        "ort_intra_op_threads": 1,
+        "ort_inter_op_threads": 1,
+        "htp_performance_mode": "burst",
     }
     values.update(overrides)
     return RuntimeConfig(**values)
