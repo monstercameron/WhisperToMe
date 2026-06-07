@@ -10,6 +10,8 @@ the system is doing.
 
 ![WhisperToMe desktop window](docs/screenshot.png)
 
+**▶ [Watch the demo](https://youtu.be/0FXNTP7N1uA)** — see WhisperToMe wake, listen, and reply on the NPU.
+
 ## Core features
 
 - **Always-listening wake loop** — continuous mic + VAD, sliding wake-phrase match, speech-pause
